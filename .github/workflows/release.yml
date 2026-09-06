@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a release be re-cut by hand (e.g. after a failed upload) without
+  # deleting and re-pushing the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to build and publish"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag whose version doesn't match Cargo.toml ships a binary that reports
+  # the wrong version from --version, and makes update.sh see a permanent
+  # "update available" -- re-downloading and restarting the service on every
+  # run. Fail before building anything.
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Compare tag against Cargo.toml and Cargo.lock
+        shell: bash
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          # [package] is the first table in Cargo.toml, and dependency
+          # versions are inline (`tokio = { version = ... }`), so the first
+          # line-anchored `version` is ours.
+          manifest="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          locked="$(grep -A2 '^name = "redir-rust"$' Cargo.lock | grep -m1 '^version' | cut -d'"' -f2)"
+          echo "tag=${tag}  Cargo.toml=${manifest}  Cargo.lock=${locked}"
+
+          if [ "$tag" != "v${manifest}" ]; then
+            echo "::error::tag ${tag} does not match Cargo.toml version ${manifest}; bump with scripts/release.sh, or retag" >&2
+            exit 1
+          fi
+
+          # A stale lockfile would otherwise fail the --locked builds three
+          # jobs later, after the matrix has already spun up.
+          if [ "$locked" != "$manifest" ]; then
+            echo "::error::Cargo.lock records redir-rust ${locked}, not ${manifest}; run cargo update -p redir-rust and commit" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # Statically linked: runs on distros older than the runner's glibc,
+          # which is what the systemd install path tends to land on.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # build.rs embeds the commit in --version, so it needs real git data.
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          version="${{ inputs.tag || github.ref_name }}"
+          name="redir-rust-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/redir-rust" "dist/${name}/"
+          cp README.md LICENSE config.example.toml "dist/${name}/" 2>/dev/null || true
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          version="${{ inputs.tag || github.ref_name }}"
+          name="redir-rust-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/redir-rust.exe" "dist/${name}/"
+          cp README.md LICENSE config.example.toml "dist/${name}/" 2>/dev/null || true
+          (cd dist && 7z a "${name}.zip" "${name}" > /dev/null)
+          (cd dist && sha256sum "${name}.zip" > "${name}.zip.sha256")
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256

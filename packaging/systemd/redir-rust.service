@@ -1,0 +1,21 @@
+[Unit]
+Description=redir-rust port redirector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/bin/redir-rust --config /etc/redir-rust/config.toml
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=info
+RuntimeDirectory=redir-rust
+
+# redir-rust logs via tracing to stdout/stderr; route both to the journal
+# so `journalctl -u redir-rust` (and --service-status) can read them.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

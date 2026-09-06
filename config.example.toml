@@ -1,0 +1,70 @@
+# Example redir-rust config. Run with: redir-rust --config config.toml
+#
+# Each [[redirect]] block is an independent listener; you can define as many
+# as you like in a single process. `name` is optional and only used to label
+# this redirect in logs (defaults to a description of the listener and target
+# list when omitted). Set exactly one of legacy `target` or ordered `targets`;
+# `targets` must contain at least one address.
+
+[[redirect]]
+name = "minecraft-survival"
+listen = "0.0.0.0:25565"
+targets = [
+  "10.0.0.10:25566", # primary: tried first for every new connection
+  "10.0.0.11:25566", # secondary: tried if the primary cannot be reached
+]
+# TCP only: this timeout applies separately to each target attempt.
+connect_timeout_ms = 3000
+
+[redirect.minecraft.plugins]
+enabled = true
+# All fields below are optional; omit them to use the built-in bilingual
+# "server unreachable" copy and the built-in scroll icon.
+status_line = "§c伺服器無法連線！ / Server unreachable!"
+motd_line1 = "§c找不到對應的伺服器 / Server not found"
+motd_line2 = "§e請檢查您的連線域名 / Please check your connection domain"
+# favicon_path = "assets/offline_icon.png"
+
+# A second, plain TCP redirect with no plugins. The singular `target` syntax
+# remains supported for backward-compatible single-target redirects.
+[[redirect]]
+name = "web-backend"
+listen = "0.0.0.0:8080"
+target = "127.0.0.1:8081"
+connect_timeout_ms = 2000
+
+# TCP-only traffic shaping (ported from the original redir's -m/-o/-w/-z
+# flags). All fields are optional and independent; set only what you need.
+[[redirect]]
+name = "shaped-tcp"
+listen = "0.0.0.0:8082"
+target = "127.0.0.1:8083"
+max_bandwidth_bps = 1000000   # 1 Mbit/s cap; omit for unlimited
+wait_in_out = "both"          # "in" (client->target), "out" (target->client), or "both"
+random_wait_ms = 20           # up to 20ms random delay per chunk; omit for no jitter
+bufsize_bytes = 16384         # read/write chunk size shaping is applied at
+
+# A Bedrock UDP relay. Each client gets its own session that expires after
+# udp_idle_timeout_ms of inactivity. Multi-target UDP selection uses ordered
+# RakNet probes and is intended for Bedrock servers; a generic single-target
+# UDP relay forwards directly without Bedrock preflight probes.
+[[redirect]]
+name = "bedrock-relay"
+protocol = "udp"
+listen = "0.0.0.0:19132"
+targets = [
+  "10.0.0.20:19133", # primary Bedrock server
+  "10.0.0.21:19133", # secondary Bedrock server
+]
+udp_idle_timeout_ms = 60000
+
+[redirect.bedrock.plugins]
+enabled = true
+# If every ordered RakNet target probe fails, clients get this canned MOTD
+# instead of just timing out.
+# Both fields are optional; omit them for the built-in bilingual copy.
+# No leading `§` codes: they work in the server-list ping but the
+# disconnect/kick screen doesn't render them, so plain text stays clean
+# on both.
+motd_line1 = "伺服器無法連線！ / Server unreachable!"
+motd_line2 = "請稍後再試 / Please Try Again"
