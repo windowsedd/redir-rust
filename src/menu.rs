@@ -1,43 +1,134 @@
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{self, ClearType};
-use crossterm::{cursor, queue};
 use redir_rust::{config_manager, service_ctl, status};
 
 use crate::setup;
 
 const ITEMS: [&str; 8] = [
-    "▶ Start",
-    "⏹ Stop",
-    "➕ Setup Config",
-    "📝 Edit Config",
-    "📋 Status",
-    "📊 Monitor",
-    "🌐 Open GUI",
-    "🚪 Exit",
+    "Start",
+    "Stop",
+    "Setup Config",
+    "Edit Config",
+    "Status",
+    "Monitor",
+    "Open GUI",
+    "Exit",
 ];
 
-const TITLE: &str = "╭────────────────────────────────────────╮\n│              redir-rust                │\n│        TCP / UDP redirect manager      │\n├────────────────────────────────────────┤";
-const BOTTOM: &str = "╰────────────────────────────────────────╯";
+const DESCRIPTIONS: [&str; 8] = [
+    "Start the service",
+    "Stop the service",
+    "Add a redirect",
+    "Change a redirect",
+    "Inspect the service",
+    "Watch traffic",
+    "Open browser manager",
+    "",
+];
+
+fn running_counts(stats: &str, now_ms: u64) -> Option<(usize, u64)> {
+    let stats: serde_json::Value = serde_json::from_str(stats).ok()?;
+    let timestamp = stats["ts_ms"].as_u64()?;
+    if now_ms.checked_sub(timestamp)? > 5_000 {
+        return None;
+    }
+    let redirects = stats["redirects"].as_array()?;
+    let connections = redirects.iter().fold(0u64, |total, r| {
+        total.saturating_add(r["connections"].as_u64().unwrap_or(0))
+    });
+    Some((redirects.len(), connections))
+}
+
+fn service_summary() -> String {
+    let state = status::state("redir-rust.service").unwrap_or_else(|_| "unknown".into());
+    let counts = match state.as_str() {
+        "stopped" | "failed" => Some((0, 0)),
+        "running" | "reloading" => std::fs::read_to_string(redir_rust::connections::STATS_FILE)
+            .ok()
+            .and_then(|stats| {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+                running_counts(&stats, now.as_millis() as u64)
+            }),
+        _ => None,
+    };
+    let summary = counts.map_or_else(
+        || "Redirects unknown    Connections unknown".into(),
+        |(redirects, connections)| {
+            format!(
+                "{redirects} redirect{}    {connections} connection{}",
+                if redirects == 1 { "" } else { "s" },
+                if connections == 1 { "" } else { "s" }
+            )
+        },
+    );
+    let state = match state.as_str() {
+        "running" => "● Running",
+        "stopped" => "○ Stopped",
+        "failed" => "● Failed",
+        "activating" => "○ Starting",
+        "deactivating" => "○ Stopping",
+        "reloading" => "○ Reloading",
+        _ => "○ Unknown",
+    };
+    format!("{state} · {summary}")
+}
+
+fn menu_title() -> String {
+    format!(
+        "redir-rust v{}\nTCP / UDP redirect manager · {}\n\n{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_AUTHORS"),
+        service_summary(),
+    )
+}
+
+/// Clack renders the terminal menu; status is refreshed each time it opens.
+fn select_with_clack() -> io::Result<Option<usize>> {
+    let mut prompt = crate::prompts::select("What would you like to do?")?;
+    cliclack::intro(format!("redir-rust · v{}", env!("CARGO_PKG_VERSION")))?;
+    cliclack::note(
+        format!("TCP / UDP redirect manager · {}", env!("CARGO_PKG_AUTHORS")),
+        service_summary(),
+    )?;
+    for (index, (label, description)) in ITEMS.iter().zip(DESCRIPTIONS).enumerate() {
+        prompt = prompt.item(index, label, description);
+    }
+    match prompt.interact() {
+        Ok(index) => Ok((index != ITEMS.len() - 1).then_some(index)),
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Err(err) => Err(err),
+    }
+}
 
 pub fn run() -> ExitCode {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     loop {
         let choice = if interactive {
-            select_with_arrows(TITLE, &ITEMS)
+            select_with_clack()
         } else {
             select_with_number()
         };
         let choice = match choice {
             Ok(Some(choice)) => choice,
-            Ok(None) => return ExitCode::SUCCESS,
+            Ok(None) => {
+                if interactive {
+                    let _ = cliclack::outro("Goodbye");
+                }
+                return ExitCode::SUCCESS;
+            }
             Err(err) => {
                 eprintln!("error: failed to read menu choice: {err}");
                 return ExitCode::FAILURE;
             }
         };
+        if interactive {
+            if let Err(err) = cliclack::clear_screen() {
+                eprintln!("error: failed to clear terminal: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
         match choice {
             0 => {
                 service_ctl::run("start", "redir-rust.service");
@@ -79,10 +170,26 @@ pub fn run() -> ExitCode {
             _ => return ExitCode::SUCCESS,
         }
         if interactive {
-            print!("\nPress Enter to return to the menu...");
-            let _ = io::stdout().flush();
-            let mut pause = String::new();
-            let _ = io::stdin().read_line(&mut pause);
+            match crate::prompts::select("Next action").and_then(|prompt| {
+                prompt
+                    .item(true, "⬅ Previous", "Main menu")
+                    .item(false, "Exit", "")
+                    .interact()
+            }) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = cliclack::outro("Goodbye");
+                    return ExitCode::SUCCESS;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    let _ = cliclack::outro("Goodbye");
+                    return ExitCode::SUCCESS;
+                }
+                Err(err) => {
+                    eprintln!("error: failed to read menu choice: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
     }
 }
@@ -90,11 +197,10 @@ pub fn run() -> ExitCode {
 /// Numbered prompt used when stdin/stdout is not a terminal.
 fn select_with_number() -> io::Result<Option<usize>> {
     loop {
-        println!("\n{TITLE}");
-        for (i, item) in ITEMS.iter().enumerate() {
-            println!("│  {}  {:<34}│", i + 1, item);
+        println!("\n{}\n", menu_title());
+        for (index, (label, description)) in ITEMS.iter().zip(DESCRIPTIONS).enumerate() {
+            println!("  {}  {label:<14} {description}", index + 1);
         }
-        println!("{BOTTOM}");
         print!("Select [1-8]: ");
         io::stdout().flush()?;
         let mut answer = String::new();
@@ -108,96 +214,25 @@ fn select_with_number() -> io::Result<Option<usize>> {
     }
 }
 
-struct RawGuard;
-
-impl RawGuard {
-    fn new() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-fn draw(title: &str, items: &[&str], selected: usize, first: bool) -> io::Result<()> {
-    let mut out = io::stdout();
-    let height = items.len() as u16 + title.lines().count() as u16 + 2;
-    if !first {
-        queue!(out, cursor::MoveUp(height))?;
-    }
-    queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
-    for line in title.split('\n') {
-        write!(out, "{line}\r\n")?;
-    }
-    for (i, item) in items.iter().enumerate() {
-        let mut label = String::new();
-        let mut width = 0;
-        for ch in item.chars() {
-            let next = ratatui::text::Span::raw(ch.to_string()).width();
-            if width + next > 35 {
-                break;
-            }
-            label.push(ch);
-            width += next;
-        }
-        label.push_str(&" ".repeat(35 - width));
-        if i == selected {
-            write!(out, "│ \x1b[7m ▶ {label}\x1b[0m│\r\n")?;
-        } else {
-            write!(out, "│    {label}│\r\n")?;
-        }
-    }
-    write!(out, "{BOTTOM}\r\n")?;
-    write!(
-        out,
-        "↑/↓ move · Enter select · number keys jump · Esc previous\r\n"
-    )?;
-    out.flush()
-}
-
-/// Arrow-key menu. Returns `None` when the user quits (q / Esc / Ctrl-C).
-pub(crate) fn select_with_arrows(title: &str, items: &[&str]) -> io::Result<Option<usize>> {
-    let mut selected = 0usize;
-    println!();
-    let _raw = RawGuard::new()?;
-    draw(title, items, selected, true)?;
-    loop {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                selected = (selected + items.len() - 1) % items.len();
-            }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                selected = (selected + 1) % items.len();
-            }
-            KeyCode::Home => selected = 0,
-            KeyCode::End => selected = items.len() - 1,
-            KeyCode::Enter => return Ok(Some(selected)),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-            KeyCode::Char('0') => return Ok(None),
-            KeyCode::Char(c) => {
-                if let Some(n) = c.to_digit(10) {
-                    if (1..=items.len() as u32).contains(&n) {
-                        return Ok(Some(n as usize - 1));
-                    }
-                }
-            }
-            _ => continue,
-        }
-        draw(title, items, selected, false)?;
-    }
-}
-
 fn config_path() -> std::io::Result<std::path::PathBuf> {
     config_manager::configured_path(&config_manager::settings_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_live_redirects_and_rejects_unavailable_snapshots() {
+        let stats = r#"{"ts_ms":10000,"redirects":[{"name":"java","connections":2},{"name":"bedrock","connections":3}]}"#;
+        assert_eq!(running_counts(stats, 12000), Some((2, 5)));
+        assert_eq!(running_counts(stats, 16000), None);
+        assert_eq!(running_counts(stats, 9000), None);
+        assert_eq!(running_counts("{}", 12000), None);
+        assert_eq!(running_counts("invalid", 12000), None);
+        assert_eq!(
+            running_counts(r#"{"ts_ms":10000,"redirects":[]}"#, 12000),
+            Some((0, 0))
+        );
+    }
 }

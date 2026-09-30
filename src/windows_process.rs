@@ -108,6 +108,13 @@ pub fn stop() -> io::Result<()> {
     Ok(())
 }
 
+pub fn running() -> io::Result<bool> {
+    match read_pid()? {
+        Some(pid) => is_running(pid),
+        None => Ok(false),
+    }
+}
+
 pub fn status() -> io::Result<bool> {
     let running = match read_pid()? {
         Some(pid) if is_running(pid)? => {

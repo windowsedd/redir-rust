@@ -24,10 +24,25 @@ control the systemd service. On Windows they control a background process using
 the config selected by `settings.json`; its PID stays in `%APPDATA%\redir-rust`
 and its log is stored beside the selected config.
 
+The main menu, **Setup Config**, and **Edit Config** use Clack-style prompts powered by
+`cliclack`: arrow keys select options, Space toggles plugin checkboxes, and Enter
+confirms. Each interactive screen clears the terminal before displaying its
+current prompt; save screens keep the review visible above the choices.
+Address menus offer all IPv4 interfaces (listen), localhost (backend),
+Tailscale, or manual IPv4/IPv6 entry. Editing also offers the current address.
+Tailscale fetches a searchable device picker from `tailscale status --json`:
+listen prompts offer this machine's addresses; backend prompts offer peer devices
+with names, IPv4/IPv6 addresses, and online status. Choose an address, then enter
+the port. Tailscale must be installed, running, and signed in. If fetching fails,
+you can retry or enter an IP manually; Previous returns to the address menu.
+Piped input keeps the plain text prompts, including the `tailscale` shortcut.
+
 📝 **Edit Config** lists the service names from the selected config file,
 then lets you edit the listen IP/port, ordered destinations, service name,
 TCP/UDP protocol, or timeout. Choose **⬅ Previous** (or press Esc) to go back;
-at value prompts, type `back` to discard the pending change. Menus support
+value menus offer Keep, Enter a new value, and Previous. Save review offers
+Save changes, Discard changes, and Previous. Esc cancels pending input; piped
+value prompts also accept `back`. Menus support
 arrow keys on a terminal and numbered choices when piped. Each change has a
 review/save prompt and is validated before writing; other service blocks are
 preserved. **🛠 Advanced editor** opens the selected named service in `$EDITOR`

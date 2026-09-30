@@ -5,10 +5,6 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{self, ClearType};
-use crossterm::{cursor, queue};
-
 use redir_rust::config::{
     BedrockConfig, BedrockPluginsConfig, MinecraftConfig, MinecraftPluginsConfig, Protocol,
     RedirectConfig, TargetConfig,
@@ -21,41 +17,65 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub fn run(path: &Path) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    run_with(&mut stdin.lock(), &mut stdout.lock(), path)
+    match run_with(&mut stdin.lock(), &mut stdout.lock(), path) {
+        Err(err) if is_cancelled(err.as_ref()) => {
+            if interactive() {
+                cliclack::outro_cancel("Returned without saving")?;
+            }
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) -> Result<()> {
-    writeln!(output, "\n╭────────────────────────────────────────╮")?;
-    writeln!(output, "│       redir-rust  ·  Setup Config       │")?;
-    writeln!(output, "╰────────────────────────────────────────╯")?;
+    if interactive() {
+        cliclack::clear_screen()?;
+        cliclack::intro("redir-rust · Setup Config")?;
+    } else {
+        writeln!(output, "\n╭────────────────────────────────────────╮")?;
+        writeln!(output, "│       redir-rust  ·  Setup Config       │")?;
+        writeln!(output, "╰────────────────────────────────────────╯")?;
+    }
     section(output, 1, "Service")?;
     let name = loop {
         let value = required(input, output, "Service name")?;
         if config_manager::name_exists(path, &value)? {
-            writeln!(
+            message(
                 output,
-                "A redirect named {value:?} already exists. Choose another name."
+                &format!("A redirect named {value:?} already exists. Choose another name."),
             )?;
         } else {
             break value;
         }
     };
-    let protocol = loop {
-        match line(input, output, "Protocol [tcp/udp, default tcp]")?
-            .to_ascii_lowercase()
-            .as_str()
+    let protocol = if interactive() {
+        match crate::prompts::select("Protocol")?
+            .item("tcp", "TCP", "")
+            .item("udp", "UDP", "")
+            .interact()?
         {
-            "" | "tcp" => break Protocol::Tcp,
-            "udp" => break Protocol::Udp,
-            _ => writeln!(output, "Enter tcp or udp.")?,
+            "udp" => Protocol::Udp,
+            _ => Protocol::Tcp,
+        }
+    } else {
+        loop {
+            match line(input, output, "Protocol [tcp/udp, default tcp]")?
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "" | "tcp" => break Protocol::Tcp,
+                "udp" => break Protocol::Udp,
+                _ => writeln!(output, "Enter tcp or udp.")?,
+            }
         }
     };
 
-    section(output, 2, "Public address")?;
-    writeln!(output, "Public address clients will connect to:")?;
-    let listen = socket(input, output, "Listen IP address", "Listen port")?;
+    section(output, 2, "Listen address")?;
+    message(output, "Accept client connections on this machine:")?;
+    let listen = socket(input, output, "Listen IP address", "Listen port", true)?;
     section(output, 3, "Backend targets")?;
-    writeln!(output, "Targets are tried in the order shown below.")?;
+    message(output, "Targets are tried in the order shown below.")?;
     let mut targets = Vec::new();
     loop {
         let label = if targets.is_empty() {
@@ -63,16 +83,28 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
         } else {
             "Failover backend"
         };
-        writeln!(output, "{label}:")?;
-        targets.push(socket(input, output, "Backend IP address", "Backend port")?);
-        if !yes_no(input, output, "Add another backend target? [y/N]", false)? {
+        message(output, label)?;
+        targets.push(socket(
+            input,
+            output,
+            "Backend IP address",
+            "Backend port",
+            false,
+        )?);
+        if !yes_no(
+            input,
+            output,
+            "Add another backend target? [y/N]",
+            false,
+            None,
+        )? {
             break;
         }
     }
     if protocol == Protocol::Udp && targets.len() > 1 {
-        writeln!(
+        message(
             output,
-            "Multi-target UDP uses Bedrock RakNet probes to select a backend."
+            "Multi-target UDP uses Bedrock RakNet probes to select a backend.",
         )?;
     }
 
@@ -99,9 +131,9 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
     if plugin_enabled {
         match protocol {
             Protocol::Tcp => {
-                writeln!(
+                message(
                     output,
-                    "Plugin text (press Enter for each built-in default):"
+                    "Plugin text (press Enter for each built-in default):",
                 )?;
                 let status_line = optional(input, output, "Status line")?;
                 let motd_line1 = optional(input, output, "MOTD line 1")?;
@@ -128,9 +160,9 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
                 });
             }
             Protocol::Udp => {
-                writeln!(
+                message(
                     output,
-                    "Plugin text (press Enter for each built-in default):"
+                    "Plugin text (press Enter for each built-in default):",
                 )?;
                 bedrock = Some(BedrockConfig {
                     plugins: Some(BedrockPluginsConfig {
@@ -144,32 +176,45 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
     }
 
     section(output, 6, "Review and save")?;
-    writeln!(output, "  Service       {name}")?;
-    writeln!(
-        output,
-        "  Protocol      {}",
-        if protocol == Protocol::Tcp {
-            "tcp"
-        } else {
-            "udp"
-        }
-    )?;
-    writeln!(output, "  Public listen {listen}")?;
+    let mut review = vec![
+        format!("Service       {name}"),
+        format!(
+            "Protocol      {}",
+            if protocol == Protocol::Tcp {
+                "tcp"
+            } else {
+                "udp"
+            }
+        ),
+        format!("Listen        {listen}"),
+    ];
     for (index, target) in targets.iter().enumerate() {
-        writeln!(
-            output,
-            "  {} target: {target}",
+        review.push(format!(
+            "{} target  {target}",
             if index == 0 { "Primary" } else { "Failover" }
-        )?;
+        ));
     }
-    writeln!(
-        output,
-        "  Plugin        {}",
+    review.push(format!(
+        "Plugin        {}",
         if plugin_enabled { plugin_label } else { "none" }
-    )?;
-    writeln!(output, "  Config file   {}", path.display())?;
-    if !yes_no(input, output, "Save this redirect? [Y/n]", true)? {
-        writeln!(output, "Cancelled; config unchanged.")?;
+    ));
+    review.push(format!("Config file   {}", path.display()));
+    let review = review.join("\n");
+    if !interactive() {
+        writeln!(output, "{review}")?;
+    }
+    if !yes_no(
+        input,
+        output,
+        "Save this redirect? [Y/n]",
+        true,
+        Some(("Review redirect", &review)),
+    )? {
+        if interactive() {
+            cliclack::outro_cancel("Cancelled; config unchanged.")?;
+        } else {
+            writeln!(output, "Cancelled; config unchanged.")?;
+        }
         return Ok(());
     }
 
@@ -190,13 +235,29 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
             bufsize_bytes: 16 * 1024,
         },
     )?;
-    writeln!(output, "Saved. Restart redir-rust to apply the new config.")?;
+    if interactive() {
+        cliclack::outro("Saved. Restart redir-rust to apply the new config.")?;
+    } else {
+        writeln!(output, "Saved. Restart redir-rust to apply the new config.")?;
+    }
     Ok(())
 }
 
 /// Guided editing from the terminal manager; raw CLI editing remains available.
 pub fn edit(path: &Path) -> Result<()> {
-    edit_with(&mut io::stdin().lock(), &mut io::stdout().lock(), path)
+    if interactive() {
+        cliclack::clear_screen()?;
+        cliclack::intro("redir-rust · Edit Config")?;
+    }
+    match edit_with(&mut io::stdin().lock(), &mut io::stdout().lock(), path) {
+        Err(err) if is_cancelled(err.as_ref()) => Ok(()),
+        result => {
+            if interactive() && result.is_ok() {
+                cliclack::outro("Returned to the manager")?;
+            }
+            result
+        }
+    }
 }
 
 fn edit_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) -> Result<()> {
@@ -319,9 +380,16 @@ fn edit_choice<R: BufRead, W: Write>(
     title: &str,
     items: &[String],
 ) -> io::Result<Option<usize>> {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        let labels: Vec<_> = items.iter().map(String::as_str).collect();
-        return crate::menu::select_with_arrows(title, &labels);
+    if interactive() {
+        let mut prompt = crate::prompts::select(title)?;
+        for (index, label) in items.iter().enumerate() {
+            prompt = prompt.item(index, label, "");
+        }
+        return match prompt.interact() {
+            Ok(index) => Ok((index < items.len() - 1).then_some(index)),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(err) => Err(err),
+        };
     }
     loop {
         writeln!(output, "\n{title}")?;
@@ -351,6 +419,29 @@ fn edit_value<R: BufRead, W: Write, T: std::str::FromStr + std::fmt::Display>(
     current: T,
     valid: impl Fn(&T) -> bool,
 ) -> io::Result<T> {
+    if interactive() {
+        match crate::prompts::select(label)?
+            .item("keep", format!("Keep {current}"), "Current value")
+            .item("change", "Enter a new value", "")
+            .item("back", "⬅ Previous", "Discard pending changes")
+            .interact()?
+        {
+            "keep" => return Ok(current),
+            "back" => return Err(io::Error::new(io::ErrorKind::Interrupted, "previous")),
+            _ => {}
+        }
+        loop {
+            let value: String = crate::prompts::input(label)?
+                .default_input(&current.to_string())
+                .interact()?;
+            match value.trim().parse::<T>() {
+                Ok(value) if valid(&value) => return Ok(value),
+                _ => {
+                    cliclack::log::warning(format!("Enter a valid {label}. Press Esc to return."))?
+                }
+            }
+        }
+    }
     loop {
         let value = line(
             input,
@@ -370,12 +461,44 @@ fn edit_value<R: BufRead, W: Write, T: std::str::FromStr + std::fmt::Display>(
     }
 }
 
+/// Discrete edit decisions include navigation as a selectable option.
+fn edit_selection<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+    current: &str,
+    options: &[(&str, &str)],
+    review: Option<(&str, &str)>,
+) -> io::Result<String> {
+    if interactive() {
+        let mut prompt =
+            crate::prompts::select(label.trim_end_matches(" y/n"))?.initial_value(current);
+        for (value, title) in options {
+            prompt = prompt.item(*value, *title, "");
+        }
+        if let Some((title, text)) = review {
+            cliclack::note(title, text)?;
+        }
+        let selected = prompt
+            .item("back", "⬅ Previous", "Discard pending changes")
+            .interact()?;
+        if selected == "back" {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "previous"));
+        }
+        return Ok(selected.to_string());
+    }
+    edit_value(input, output, label, current.to_string(), |value| {
+        options.iter().any(|(option, _)| value == option)
+    })
+}
+
 fn edit_socket<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     current: SocketAddr,
+    local: bool,
 ) -> io::Result<SocketAddr> {
-    let ip = edit_value(input, output, "IP address", current.ip(), |_| true)?;
+    let ip = ip_address(input, output, "IP address", Some(current.ip()), local)?;
     let port = edit_value(input, output, "Port (1-65535)", current.port(), |p| *p > 0)?;
     Ok(SocketAddr::new(ip, port))
 }
@@ -389,7 +512,7 @@ fn edit_field<R: BufRead, W: Write>(
     mut redirect: RedirectConfig,
 ) -> Result<()> {
     match field {
-        0 => redirect.listen = edit_socket(input, output, redirect.listen)?,
+        0 => redirect.listen = edit_socket(input, output, redirect.listen, true)?,
         1 => {
             let mut targets = Vec::new();
             loop {
@@ -404,13 +527,17 @@ fn edit_field<R: BufRead, W: Write>(
                     "🎯 Destination {} (priority order)",
                     targets.len() + 1
                 )?;
-                targets.push(edit_socket(input, output, current)?);
-                let more = edit_value(
+                targets.push(edit_socket(input, output, current, false)?);
+                let more = edit_selection(
                     input,
                     output,
                     "Add another destination? y/n",
-                    "n".to_string(),
-                    |s| matches!(s.as_str(), "y" | "n"),
+                    "n",
+                    &[
+                        ("y", "Yes — add another destination"),
+                        ("n", "No — continue to review"),
+                    ],
+                    None,
                 )?;
                 if more == "n" {
                     break;
@@ -433,12 +560,13 @@ fn edit_field<R: BufRead, W: Write>(
             } else {
                 "udp"
             };
-            let value = edit_value(
+            let value = edit_selection(
                 input,
                 output,
                 "Protocol tcp/udp",
-                current.to_string(),
-                |s| matches!(s.as_str(), "tcp" | "udp"),
+                current,
+                &[("tcp", "TCP"), ("udp", "UDP")],
+                None,
             )?;
             redirect.protocol = if value == "tcp" {
                 Protocol::Tcp
@@ -459,18 +587,21 @@ fn edit_field<R: BufRead, W: Write>(
     if redirect.protocol == Protocol::Udp && redirect.target_config.as_slice().len() > 1 {
         writeln!(output, "Multi-target UDP uses Bedrock RakNet probes.")?;
     }
-    writeln!(
-        output,
-        "\n📋 Review service: {}",
+    let title = format!(
+        "Review service: {}",
         redirect.name.as_deref().unwrap_or("Unnamed")
-    )?;
-    writeln!(output, "{}", toml::to_string(&redirect)?)?;
-    let save = edit_value(
+    );
+    let review = toml::to_string(&redirect)?;
+    if !interactive() {
+        writeln!(output, "\n📋 {title}\n{review}")?;
+    }
+    let save = edit_selection(
         input,
         output,
         "💾 Save changes? y/n",
-        "y".to_string(),
-        |s| matches!(s.as_str(), "y" | "n"),
+        "y",
+        &[("y", "Yes — save changes"), ("n", "No — discard changes")],
+        Some((&title, &review)),
     )?;
     if save == "y" {
         config_manager::update(path, index, redirect)?;
@@ -481,11 +612,32 @@ fn edit_field<R: BufRead, W: Write>(
     Ok(())
 }
 
+fn interactive() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn is_cancelled(err: &(dyn Error + 'static)) -> bool {
+    err.downcast_ref::<io::Error>()
+        .is_some_and(|err| err.kind() == io::ErrorKind::Interrupted)
+}
+
+fn message<W: Write>(output: &mut W, text: &str) -> io::Result<()> {
+    if interactive() {
+        cliclack::log::info(text)
+    } else {
+        writeln!(output, "{text}")
+    }
+}
+
 fn section<W: Write>(output: &mut W, number: usize, title: &str) -> io::Result<()> {
-    writeln!(output, "\n  ── {number}/6  {title} ──")
+    message(output, &format!("{number}/6 · {title}"))
 }
 
 fn line<R: BufRead, W: Write>(input: &mut R, output: &mut W, label: &str) -> io::Result<String> {
+    if interactive() {
+        let value: String = crate::prompts::input(label)?.required(false).interact()?;
+        return Ok(value.trim().to_string());
+    }
     write!(output, "{label}: ")?;
     output.flush()?;
     let mut value = String::new();
@@ -503,6 +655,18 @@ fn required<R: BufRead, W: Write>(
     output: &mut W,
     label: &str,
 ) -> io::Result<String> {
+    if interactive() {
+        return crate::prompts::input(label)?
+            .validate(|value: &String| {
+                if value.trim().is_empty() {
+                    Err("Value is required")
+                } else {
+                    Ok(())
+                }
+            })
+            .interact::<String>()
+            .map(|value| value.trim().to_string());
+    }
     loop {
         let value = line(input, output, label)?;
         if !value.is_empty() {
@@ -525,22 +689,169 @@ fn socket<R: BufRead, W: Write>(
     output: &mut W,
     host_label: &str,
     port_label: &str,
+    local: bool,
 ) -> io::Result<SocketAddr> {
-    let ip = loop {
-        let value = required(input, output, host_label)?;
-        match value.parse::<IpAddr>() {
-            Ok(ip) => break ip,
-            Err(_) => writeln!(output, "Enter a valid IPv4 or IPv6 address.")?,
-        }
-    };
-    let port = loop {
-        let value = required(input, output, port_label)?;
-        match value.parse::<u16>() {
-            Ok(port) if port > 0 => break port,
-            _ => writeln!(output, "Enter a port from 1 to 65535.")?,
+    let ip = ip_address(input, output, host_label, None, local)?;
+    let port = if interactive() {
+        crate::prompts::input(port_label)?
+            .validate(|value: &String| {
+                if value.parse::<u16>().is_ok_and(|port| port > 0) {
+                    Ok(())
+                } else {
+                    Err("Enter a port from 1 to 65535")
+                }
+            })
+            .interact::<u16>()?
+    } else {
+        loop {
+            let value = required(input, output, port_label)?;
+            match value.parse::<u16>() {
+                Ok(port) if port > 0 => break port,
+                _ => writeln!(output, "Enter a port from 1 to 65535.")?,
+            }
         }
     };
     Ok(SocketAddr::new(ip, port))
+}
+
+fn ip_address<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    label: &str,
+    current: Option<IpAddr>,
+    local: bool,
+) -> io::Result<IpAddr> {
+    if interactive() {
+        loop {
+            let mut prompt = crate::prompts::select(label)?;
+            if let Some(ip) = current {
+                prompt = prompt.item("current", format!("Keep {ip}"), "Current address");
+            }
+            prompt = if local {
+                prompt.item("any", "All IPv4 interfaces", "0.0.0.0")
+            } else {
+                prompt.item("tailscale", "Choose a Tailscale device", "Backend peers")
+            };
+            prompt = if local {
+                prompt.item("tailscale", "This device's Tailscale address", "")
+            } else {
+                prompt.item("localhost", "Localhost", "127.0.0.1")
+            };
+            match prompt
+                .item("manual", "Enter an IP address", "IPv4 or IPv6")
+                .item("back", "⬅ Previous", "Discard pending input")
+                .interact()?
+            {
+                "current" => return Ok(current.expect("current option requires an address")),
+                "any" => return Ok(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                "localhost" => return Ok(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                "back" => return Err(io::Error::new(io::ErrorKind::Interrupted, "previous")),
+                "tailscale" => {
+                    if let Some(ip) = tailscale_address(input, output, local)? {
+                        return Ok(ip);
+                    }
+                }
+                _ => {
+                    let value: IpAddr = crate::prompts::input("IP address")?
+                        .placeholder("IPv4 or IPv6")
+                        .interact()?;
+                    return Ok(value);
+                }
+            }
+        }
+    }
+    loop {
+        let default = current.map(|ip| format!(" [{ip}]")).unwrap_or_default();
+        let value = line(
+            input,
+            output,
+            &format!("{label}{default} (tailscale = choose device, back = Previous)"),
+        )?;
+        if value.eq_ignore_ascii_case("back") {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "previous"));
+        }
+        if value.is_empty() {
+            if let Some(ip) = current {
+                return Ok(ip);
+            }
+        }
+        if value.eq_ignore_ascii_case("tailscale") {
+            if let Some(ip) = tailscale_address(input, output, local)? {
+                return Ok(ip);
+            }
+        } else if let Ok(ip) = value.parse() {
+            return Ok(ip);
+        } else {
+            writeln!(
+                output,
+                "Enter a valid IPv4 or IPv6 address, or type tailscale."
+            )?;
+        }
+    }
+}
+
+fn tailscale_address<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    local: bool,
+) -> io::Result<Option<IpAddr>> {
+    let spinner = interactive().then(cliclack::spinner);
+    if let Some(spinner) = &spinner {
+        spinner.start("Fetching Tailscale devices");
+    } else {
+        writeln!(output, "Fetching Tailscale devices…")?;
+    }
+    let result = crate::tailscale::fetch(local);
+    if let Some(spinner) = &spinner {
+        spinner.stop("Tailscale lookup finished");
+    }
+    match result {
+        Ok(devices) if !devices.is_empty() => choose_tailscale(input, output, &devices),
+        Ok(_) => {
+            message(
+                output,
+                "No Tailscale addresses available. Choose another address source or retry.",
+            )?;
+            Ok(None)
+        }
+        Err(err) => {
+            message(
+                output,
+                &format!("Cannot fetch Tailscale devices: {err}. Enter an IP manually or retry."),
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn choose_tailscale<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    devices: &[crate::tailscale::DeviceAddress],
+) -> io::Result<Option<IpAddr>> {
+    if interactive() {
+        let mut prompt = crate::prompts::select("Choose a Tailscale device/address")?
+            .filter_mode()
+            .max_rows(10);
+        for (index, device) in devices.iter().enumerate() {
+            prompt = prompt.item(index, &device.label, "");
+        }
+        return match prompt
+            .item(devices.len(), "Previous", "Address source")
+            .interact()
+        {
+            Ok(index) => Ok(devices.get(index).map(|device| device.ip)),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(None),
+            Err(err) => Err(err),
+        };
+    }
+    let mut labels: Vec<_> = devices.iter().map(|device| device.label.clone()).collect();
+    labels.push("⬅ Previous (manual IP)".into());
+    Ok(
+        edit_choice(input, output, "Choose a Tailscale device/address", &labels)?
+            .filter(|index| *index < devices.len())
+            .map(|index| devices[index].ip),
+    )
 }
 
 fn positive_or_default<R: BufRead, W: Write>(
@@ -549,6 +860,18 @@ fn positive_or_default<R: BufRead, W: Write>(
     label: &str,
     default: u64,
 ) -> io::Result<u64> {
+    if interactive() {
+        return crate::prompts::input(label)?
+            .default_input(&default.to_string())
+            .validate(|value: &String| {
+                if value.parse::<u64>().is_ok_and(|number| number > 0) {
+                    Ok(())
+                } else {
+                    Err("Enter a positive number")
+                }
+            })
+            .interact();
+    }
     loop {
         let value = line(input, output, label)?;
         if value.is_empty() {
@@ -569,7 +892,24 @@ fn yes_no<R: BufRead, W: Write>(
     output: &mut W,
     label: &str,
     default: bool,
+    review: Option<(&str, &str)>,
 ) -> io::Result<bool> {
+    if interactive() {
+        let title = label.trim_end_matches(" [y/N]").trim_end_matches(" [Y/n]");
+        let mut selected = crate::prompts::select(title)?
+            .item("yes", "Yes", "")
+            .item("no", "No", "")
+            .item("back", "⬅ Previous", "Return without saving")
+            .initial_value(if default { "yes" } else { "no" });
+        if let Some((title, text)) = review {
+            cliclack::note(title, text)?;
+        }
+        match selected.interact()? {
+            "yes" => return Ok(true),
+            "no" => return Ok(false),
+            _ => return Err(io::Error::new(io::ErrorKind::Interrupted, "previous")),
+        }
+    }
     loop {
         match line(input, output, label)?.to_ascii_lowercase().as_str() {
             "" => return Ok(default),
@@ -581,8 +921,12 @@ fn yes_no<R: BufRead, W: Write>(
 }
 
 fn checkbox<R: BufRead, W: Write>(input: &mut R, output: &mut W, label: &str) -> io::Result<bool> {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return tty_checkbox(output, label);
+    if interactive() {
+        return Ok(!crate::prompts::multiselect("Enable optional plugins")?
+            .item(0, label, "Handles offline responses")
+            .required(false)
+            .interact()?
+            .is_empty());
     }
     let mut selected = false;
     loop {
@@ -602,58 +946,6 @@ fn checkbox<R: BufRead, W: Write>(input: &mut R, output: &mut W, label: &str) ->
                 output,
                 "Enter 1 to toggle the checkbox, or press Enter to continue."
             )?,
-        }
-    }
-}
-
-struct RawMode;
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-fn tty_checkbox<W: Write>(output: &mut W, label: &str) -> io::Result<bool> {
-    terminal::enable_raw_mode()?;
-    let _raw = RawMode;
-    let mut selected = false;
-    let mut row = 0;
-    let mut first = true;
-    loop {
-        if !first {
-            queue!(
-                output,
-                cursor::MoveUp(3),
-                terminal::Clear(ClearType::FromCursorDown)
-            )?;
-        }
-        first = false;
-        write!(output, "  ↑/↓ choose · Space toggle · Enter select\r\n")?;
-        write!(
-            output,
-            "  {} [{}] {label}\r\n",
-            if row == 0 { "▶" } else { " " },
-            if selected { 'x' } else { ' ' }
-        )?;
-        write!(
-            output,
-            "  {} Continue\r\n",
-            if row == 1 { "▶" } else { " " }
-        )?;
-        output.flush()?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match key.code {
-            KeyCode::Up | KeyCode::Down => row = 1 - row,
-            KeyCode::Char(' ') => selected = !selected,
-            KeyCode::Enter if row == 0 => selected = !selected,
-            KeyCode::Enter => return Ok(selected),
-            _ => {}
         }
     }
 }
@@ -681,6 +973,39 @@ mod tests {
         let original = "# Keep this header\n[[redirect]]\nname = \"service.java\"\nlisten = \"0.0.0.0:25565\"\ntarget = \"127.0.0.1:25566\"\n\n[[redirect]] # keep this block exactly\nname = \"service.bedrock\"\nlisten = \"0.0.0.0:19132\"\ntargets = [\"127.0.0.1:19133\", \"127.0.0.1:19134\"]\nprotocol = \"udp\"\n";
         fs::write(path, original).unwrap();
         original.to_string()
+    }
+
+    #[test]
+    fn tailscale_picker_selects_address_and_allows_manual_return() {
+        let devices = vec![crate::tailscale::DeviceAddress {
+            label: "backend — fd7a:115c:a1e0::2 (online)".into(),
+            ip: "fd7a:115c:a1e0::2".parse().unwrap(),
+        }];
+        let mut output = Vec::new();
+        assert_eq!(
+            choose_tailscale(&mut Cursor::new("1\n"), &mut output, &devices).unwrap(),
+            Some(devices[0].ip)
+        );
+        assert!(String::from_utf8(output.clone())
+            .unwrap()
+            .contains("backend"));
+        assert_eq!(
+            choose_tailscale(&mut Cursor::new("back\n"), &mut output, &devices).unwrap(),
+            None
+        );
+        let current = "100.64.0.1:25565".parse().unwrap();
+        assert_eq!(
+            edit_socket(&mut Cursor::new("\n25566\n"), &mut output, current, true)
+                .unwrap()
+                .to_string(),
+            "100.64.0.1:25566"
+        );
+        assert_eq!(
+            edit_socket(&mut Cursor::new("back\n"), &mut output, current, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
     }
 
     #[test]

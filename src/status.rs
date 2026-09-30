@@ -6,6 +6,31 @@ use std::process::ExitCode;
 #[cfg(not(windows))]
 use std::process::{Command, Output};
 
+/// Quiet state query for the menu; unavailable service managers remain unknown.
+#[cfg(not(windows))]
+pub fn state(unit: &str) -> std::io::Result<String> {
+    let output = Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(match state.as_str() {
+        "active" => "running".into(),
+        "inactive" => "stopped".into(),
+        "failed" | "activating" | "deactivating" | "reloading" => state,
+        _ => "unknown".into(),
+    })
+}
+
+#[cfg(windows)]
+pub fn state(_unit: &str) -> std::io::Result<String> {
+    Ok(if crate::windows_process::running()? {
+        "running"
+    } else {
+        "stopped"
+    }
+    .into())
+}
+
 #[cfg(not(windows))]
 pub fn run(unit: &str) -> ExitCode {
     match Command::new("systemctl")

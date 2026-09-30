@@ -15,7 +15,9 @@ use redir_rust::{config_manager, conn_worker, edit_config, install, notify, serv
 
 mod gui;
 mod menu;
+mod prompts;
 mod setup;
+mod tailscale;
 
 /// A Rust port redirector with plugin support, inspired by `redir`.
 ///
