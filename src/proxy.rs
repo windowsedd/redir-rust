@@ -169,7 +169,7 @@ async fn handle_connection(
 
     info!(client = %client_addr, target = %target_addr, "connected, proxying");
 
-    let _tracking = connections::track(&config.name, "tcp", client_addr, target_addr);
+    let tracking = connections::track(&config.name, "tcp", client_addr, target_addr);
     let started = Instant::now();
     let result = crate::conn_worker::run(
         client,
@@ -177,6 +177,7 @@ async fn handle_connection(
         plugins,
         config.shaping.as_ref(),
         config.worker_executable.as_deref(),
+        Some(tracking.traffic()),
     )
     .await;
     match &result {
@@ -227,6 +228,7 @@ pub(crate) async fn pipe(
     mut target: TcpStream,
     plugins: &[Arc<dyn Plugin>],
     shaping: Option<&ShapingConfig>,
+    traffic: Option<connections::TrafficHandle>,
 ) -> io::Result<()> {
     let (mut client_rd, mut client_wr) = client.split();
     let (mut target_rd, mut target_wr) = target.split();
@@ -236,6 +238,7 @@ pub(crate) async fn pipe(
         Direction::ClientToTarget,
         plugins,
         shaping,
+        traffic.clone(),
     );
     let target_to_client = forward(
         &mut target_rd,
@@ -243,11 +246,10 @@ pub(crate) async fn pipe(
         Direction::TargetToClient,
         plugins,
         shaping,
+        traffic,
     );
-    tokio::select! {
-        result = client_to_target => result,
-        result = target_to_client => result,
-    }
+    tokio::try_join!(client_to_target, target_to_client)?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -257,6 +259,7 @@ async fn forward<R, W>(
     direction: Direction,
     plugins: &[Arc<dyn Plugin>],
     shaping: Option<&ShapingConfig>,
+    traffic: Option<connections::TrafficHandle>,
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -294,6 +297,12 @@ where
             chunk = data;
         }
         writer.write_all(chunk).await?;
+        if let Some(traffic) = &traffic {
+            match direction {
+                Direction::ClientToTarget => traffic.add_up(chunk.len() as u64),
+                Direction::TargetToClient => traffic.add_down(chunk.len() as u64),
+            }
+        }
         if let Some(limiter) = &mut limiter {
             tokio::time::sleep(limiter.wait_for(n)).await;
         }

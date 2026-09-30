@@ -4,20 +4,24 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 
 use redir_rust::config::{self, FileConfig, Protocol, RedirectConfig};
 use redir_rust::plugin::Plugin;
 use redir_rust::plugins::MinecraftOfflinePlugin;
 use redir_rust::proxy::{self, ProxyConfig};
 use redir_rust::udp_proxy::{self, UdpProxyConfig};
-use redir_rust::{conn_worker, edit_config, install, notify, service_ctl, status};
+use redir_rust::{config_manager, conn_worker, edit_config, install, notify, service_ctl, status};
+
+mod gui;
+mod menu;
+mod setup;
 
 /// A Rust port redirector with plugin support, inspired by `redir`.
 ///
-/// Either pass `--config <FILE>` to run one or more redirects defined in a
-/// TOML file, or pass `--listen` and one or more `--target` flags (plus other
-/// flags) to run a single redirect directly from the command line.
+/// Pass `--settings <FILE>` to select a JSON settings file pointing to a TOML
+/// config, `--config <FILE>` to select the TOML file directly, or `--listen`
+/// and one or more `--target` flags to run a single redirect.
 #[derive(Parser, Debug)]
 #[command(
     name = "redir-rust",
@@ -26,13 +30,23 @@ use redir_rust::{conn_worker, edit_config, install, notify, service_ctl, status}
     about
 )]
 struct Cli {
+    /// Open the local graphical manager in your default browser.
+    #[arg(long, conflicts_with = "config")]
+    gui: bool,
+    /// Address for --gui (default: all IPv4 interfaces, automatic port).
+    #[arg(long = "gui-bind", value_name = "IP:PORT", requires = "gui")]
+    gui_bind: Option<SocketAddr>,
     /// Path to a TOML config file defining one or more [[redirect]] entries.
-    /// When set, all other redirect flags below are ignored.
+    /// In run mode, redirect flags cannot be combined with this; with --add, they define the new redirect.
     #[arg(short = 'c', long = "config")]
     config: Option<std::path::PathBuf>,
 
+    /// JSON settings file with a config_path field (default: OS settings directory).
+    #[arg(long = "settings")]
+    settings: Option<std::path::PathBuf>,
+
     /// Install this binary as a systemd service (copies itself to
-    /// /usr/local/bin, writes /etc/redir-rust/config.toml if missing, and
+    /// /usr/local/bin, writes /etc/local/redir-rust/config.toml if missing, and
     /// installs + enables the unit file). Requires root. Linux only.
     #[arg(long = "install-systemd")]
     install_systemd: bool,
@@ -43,20 +57,23 @@ struct Cli {
     #[arg(long = "update")]
     update: bool,
 
-    /// Print `systemctl status` for the unit (--unit), as-is. Prints and
-    /// exits; does not start any redirects.
+    /// Show systemd status on Linux or background-process status on Windows.
     #[arg(long = "service-status", visible_alias = "status")]
     service_status: bool,
 
-    /// Start the systemd unit (`systemctl start <unit>`). Requires root.
+    /// Open a btop-style live monitor of the running service's connections and traffic.
+    #[arg(long = "monitor")]
+    monitor: bool,
+
+    /// Start the systemd unit on Linux or background process on Windows.
     #[arg(long = "start")]
     service_start: bool,
 
-    /// Stop the systemd unit (`systemctl stop <unit>`). Requires root.
+    /// Stop the systemd unit on Linux or background process on Windows.
     #[arg(long = "stop")]
     service_stop: bool,
 
-    /// Restart the systemd unit (`systemctl restart <unit>`). Requires root.
+    /// Restart the systemd unit on Linux or background process on Windows.
     #[arg(long = "restart")]
     service_restart: bool,
 
@@ -64,24 +81,40 @@ struct Cli {
     #[arg(long = "unit", default_value = "redir-rust.service")]
     unit: String,
 
-    /// Open the config file (--config, default /etc/redir-rust/config.toml)
+    /// Directory for --install-systemd and --update (default /usr/local/bin).
+    #[arg(long = "bin-dir", default_value = "/usr/local/bin")]
+    bin_dir: std::path::PathBuf,
+
+    /// Open the config file (--config, otherwise the path in settings.json)
     /// in $EDITOR, creating it from the default template first if it
     /// doesn't exist, then re-validate it after the editor exits. Does not
     /// restart the service.
     #[arg(short = 'e', long = "edit-config")]
     edit_config: bool,
 
+    /// Add a named redirect to the config using --name, --listen, and --target.
+    #[arg(long, conflicts_with_all = ["remove", "edit", "edit_config"])]
+    add: bool,
+
+    /// Remove a redirect by name from the config.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["add", "edit", "edit_config"])]
+    remove: Option<String>,
+
+    /// Open one named redirect in $EDITOR and validate it before saving.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["add", "remove", "edit_config"])]
+    edit: Option<String>,
+
     /// Optional label used in logs to identify this redirect.
     #[arg(short = 'n', long = "name")]
     name: Option<String>,
 
     /// Local address to listen on, e.g. 0.0.0.0:25565
-    #[arg(short = 'l', long = "listen", required_unless_present_any = ["config", "install_systemd", "update", "service_status", "service_start", "service_stop", "service_restart", "edit_config"])]
+    #[arg(short = 'l', long = "listen", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "edit_config", "remove", "edit"])]
     listen: Option<SocketAddr>,
 
     /// Backend target address to forward connections to, in priority order.
     /// Repeat for additional targets, e.g. `-t 127.0.0.1:25566 -t 127.0.0.1:25567`.
-    #[arg(short = 't', long = "target", value_name = "TARGET", required_unless_present_any = ["config", "install_systemd", "update", "service_status", "service_start", "service_stop", "service_restart", "edit_config"])]
+    #[arg(short = 't', long = "target", value_name = "TARGET", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "edit_config", "remove", "edit"])]
     targets: Vec<SocketAddr>,
 
     /// Transport to relay: "tcp" (default) or "udp".
@@ -165,12 +198,46 @@ fn main() -> ExitCode {
     if conn_worker::is_worker_invocation() {
         return conn_worker::run_worker();
     }
+    if std::env::args_os().len() == 1 {
+        return menu::run();
+    }
     real_main()
 }
 
 #[tokio::main]
 async fn real_main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+
+    if (cli.config.is_some() || cli.settings.is_some()) && !cli.add {
+        let redirect_flags = [
+            "name",
+            "listen",
+            "targets",
+            "protocol",
+            "connect_timeout_ms",
+            "udp_idle_timeout_ms",
+            "minecraft_offline_motd",
+            "status_line",
+            "motd_line1",
+            "motd_line2",
+            "favicon_path",
+            "bedrock_offline_motd",
+            "bedrock_motd_line1",
+            "bedrock_motd_line2",
+            "max_bandwidth_bps",
+            "wait_in_out",
+            "random_wait_ms",
+            "bufsize_bytes",
+        ];
+        if redirect_flags
+            .iter()
+            .any(|id| matches.value_source(id) == Some(ValueSource::CommandLine))
+        {
+            eprintln!("error: redirect flags cannot be combined with --config in run mode; use --add to save a redirect");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let default_level = if cli.debug { "debug" } else { "info" };
     tracing_subscriber::fmt()
@@ -181,21 +248,19 @@ async fn real_main() -> ExitCode {
         .init();
 
     if cli.install_systemd {
-        return install::run();
+        return install::run(&cli.bin_dir);
     }
 
     if cli.update {
-        return install::update(&cli.unit);
+        return install::update(&cli.unit, &cli.bin_dir);
     }
-
-    let config_path_or_default = || {
-        cli.config
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc/redir-rust/config.toml"))
-    };
 
     if cli.service_status {
         return status::run(&cli.unit);
+    }
+
+    if cli.monitor {
+        return redir_rust::monitor::run();
     }
 
     if cli.service_start {
@@ -210,66 +275,121 @@ async fn real_main() -> ExitCode {
         return service_ctl::run("restart", &cli.unit);
     }
 
-    if cli.edit_config {
-        return edit_config::run(&config_path_or_default());
+    let config_path = match &cli.config {
+        Some(path) => path.clone(),
+        None if cli.settings.is_some()
+            || cli.gui
+            || cli.edit_config
+            || cli.add
+            || cli.remove.is_some()
+            || cli.edit.is_some() =>
+        {
+            let settings = cli
+                .settings
+                .clone()
+                .unwrap_or_else(config_manager::settings_path);
+            match config_manager::configured_path(&settings) {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!(
+                        "error: failed to read settings {}: {err}",
+                        settings.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => config_manager::default_path(),
+    };
+
+    if cli.gui {
+        return gui::run(
+            &config_path,
+            cli.gui_bind.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
+        );
     }
 
-    let redirects = match &cli.config {
-        Some(path) => match FileConfig::load(path) {
+    if cli.edit_config {
+        return edit_config::run(&config_path);
+    }
+
+    if cli.add {
+        if cli.name.as_deref().is_none_or(str::is_empty)
+            || cli.listen.is_none()
+            || cli.targets.is_empty()
+        {
+            eprintln!("error: --add requires --name, --listen, and at least one --target");
+            return ExitCode::FAILURE;
+        }
+        let name = cli.name.as_deref().unwrap();
+        return match config_manager::add(&config_path, cli_redirect(&cli)) {
+            Ok(()) => {
+                println!("added redirect {name:?}; restart redir-rust to apply it");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(name) = &cli.remove {
+        return match config_manager::remove(&config_path, name) {
+            Ok(last_redirect) => {
+                if last_redirect {
+                    println!("removed redirect {name:?}; no redirects remain, so stop redir-rust");
+                } else {
+                    println!("removed redirect {name:?}; restart redir-rust to apply it");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if let Some(name) = &cli.edit {
+        return match config_manager::edit(&config_path, name) {
+            Ok(()) => {
+                println!("edited redirect {name:?}; restart redir-rust to apply it");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    let redirects = match cli.config.as_ref().or(cli.settings.as_ref()) {
+        Some(_) => match FileConfig::load(&config_path) {
             Ok(file) => file.redirects,
             Err(err) => {
                 tracing::error!(%err, "failed to load config file");
                 return ExitCode::FAILURE;
             }
         },
-        None => vec![RedirectConfig {
-            name: cli.name.clone(),
-            listen: cli.listen.expect("clap enforces listen when no config"),
-            target_config: config::TargetConfig::from_ordered(cli.targets.clone()),
-            protocol: cli.protocol,
-            connect_timeout_ms: cli.connect_timeout_ms,
-            udp_idle_timeout_ms: cli.udp_idle_timeout_ms,
-            minecraft: cli.minecraft_offline_motd.then(|| config::MinecraftConfig {
-                plugins: Some(config::MinecraftPluginsConfig {
-                    enabled: true,
-                    status_line: cli.status_line.clone(),
-                    motd_line1: cli.motd_line1.clone(),
-                    motd_line2: cli.motd_line2.clone(),
-                    favicon_path: cli.favicon_path.clone(),
-                }),
-            }),
-            bedrock: cli.bedrock_offline_motd.then(|| config::BedrockConfig {
-                plugins: Some(config::BedrockPluginsConfig {
-                    enabled: true,
-                    motd_line1: cli.bedrock_motd_line1.clone(),
-                    motd_line2: cli.bedrock_motd_line2.clone(),
-                }),
-            }),
-            max_bandwidth_bps: cli.max_bandwidth_bps,
-            wait_in_out: cli.wait_in_out,
-            random_wait_ms: cli.random_wait_ms,
-            bufsize_bytes: cli.bufsize_bytes,
-        }],
+        None => vec![cli_redirect(&cli)],
     };
 
     let mut tasks = tokio::task::JoinSet::new();
+    let mut startup = Vec::new();
     for redirect in redirects {
-        tasks.spawn(run_redirect(redirect));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        startup.push(ready_rx);
+        tasks.spawn(run_redirect(redirect, ready_tx));
+    }
+    for ready in startup {
+        if ready.await.is_err() {
+            let _ = wait_for_tasks(&mut tasks).await;
+            return ExitCode::FAILURE;
+        }
     }
 
-    // Tells systemd (Type=notify units) we're up, so `systemctl status`
-    // moves past "activating" and dependent units can start. No-op if not
-    // running under systemd.
     notify::ready();
+    redir_rust::connections::spawn_snapshot_task();
 
-    // Without this, Ctrl+C falls through to the OS default: the process is
-    // killed outright (on Windows, exit code 0xc000013a /
-    // STATUS_CONTROL_C_EXIT), which terminals/wrappers like `cargo run`
-    // report as a failure even though stopping a foreground test run with
-    // Ctrl+C is completely normal. Racing it here lets us log the shutdown
-    // and return a clean exit code instead. Dropping `tasks` (JoinSet) on
-    // this branch aborts every still-running redirect, which is fine --
-    // there's nothing to gracefully drain, just listening sockets to close.
     let failed = tokio::select! {
         failed = wait_for_tasks(&mut tasks) => failed,
         _ = tokio::signal::ctrl_c() => {
@@ -285,32 +405,73 @@ async fn real_main() -> ExitCode {
     }
 }
 
+fn cli_redirect(cli: &Cli) -> RedirectConfig {
+    RedirectConfig {
+        name: cli.name.clone(),
+        listen: cli.listen.expect("clap enforces listen when no config"),
+        target_config: config::TargetConfig::from_ordered(cli.targets.clone()),
+        protocol: cli.protocol,
+        connect_timeout_ms: cli.connect_timeout_ms,
+        udp_idle_timeout_ms: cli.udp_idle_timeout_ms,
+        minecraft: cli.minecraft_offline_motd.then(|| config::MinecraftConfig {
+            plugins: Some(config::MinecraftPluginsConfig {
+                enabled: true,
+                status_line: cli.status_line.clone(),
+                motd_line1: cli.motd_line1.clone(),
+                motd_line2: cli.motd_line2.clone(),
+                favicon_path: cli.favicon_path.clone(),
+            }),
+        }),
+        bedrock: cli.bedrock_offline_motd.then(|| config::BedrockConfig {
+            plugins: Some(config::BedrockPluginsConfig {
+                enabled: true,
+                motd_line1: cli.bedrock_motd_line1.clone(),
+                motd_line2: cli.bedrock_motd_line2.clone(),
+            }),
+        }),
+        max_bandwidth_bps: cli.max_bandwidth_bps,
+        wait_in_out: cli.wait_in_out,
+        random_wait_ms: cli.random_wait_ms,
+        bufsize_bytes: cli.bufsize_bytes,
+    }
+}
+
 async fn wait_for_tasks(tasks: &mut tokio::task::JoinSet<std::io::Result<()>>) -> bool {
-    let mut failed = false;
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::error!(%err, "redirect exited with error");
-                failed = true;
+                return true;
             }
             Err(join_err) => {
                 tracing::error!(%join_err, "redirect task panicked");
-                failed = true;
+                return true;
             }
         }
     }
-    failed
+    false
 }
 
-async fn run_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
+async fn run_redirect(
+    redirect: RedirectConfig,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> std::io::Result<()> {
+    let protocol = match redirect.protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+    };
+    redir_rust::connections::register_redirect(&redirect.display_name(), protocol, redirect.listen);
     match redirect.protocol {
-        Protocol::Tcp => run_tcp_redirect(redirect).await,
-        Protocol::Udp => run_udp_redirect(redirect).await,
+        Protocol::Tcp => run_tcp_redirect(redirect, ready).await,
+        Protocol::Udp => run_udp_redirect(redirect, ready).await,
     }
 }
 
-async fn run_udp_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
+async fn run_udp_redirect(
+    redirect: RedirectConfig,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> std::io::Result<()> {
     if redirect.minecraft_plugins().is_some() {
         tracing::warn!(
             name = %redirect.display_name(),
@@ -341,10 +502,15 @@ async fn run_udp_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
         bedrock_offline,
     };
 
-    udp_proxy::run(config).await
+    let socket = tokio::net::UdpSocket::bind(config.listen_addr).await?;
+    let _ = ready.send(());
+    udp_proxy::run_with_socket(config, socket).await
 }
 
-async fn run_tcp_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
+async fn run_tcp_redirect(
+    redirect: RedirectConfig,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> std::io::Result<()> {
     if redirect.bedrock_plugins().is_some() {
         tracing::warn!(
             name = %redirect.display_name(),
@@ -362,8 +528,12 @@ async fn run_tcp_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
             }
             if mc.motd_line1.is_some() || mc.motd_line2.is_some() {
                 plugin = plugin.with_motd(
-                    mc.motd_line1.clone().unwrap_or_default(),
-                    mc.motd_line2.clone().unwrap_or_default(),
+                    mc.motd_line1
+                        .clone()
+                        .unwrap_or_else(redir_rust::plugins::minecraft_offline::default_motd_line1),
+                    mc.motd_line2
+                        .clone()
+                        .unwrap_or_else(redir_rust::plugins::minecraft_offline::default_motd_line2),
                 );
             }
             if let Some(favicon_path) = &mc.favicon_path {
@@ -388,13 +558,26 @@ async fn run_tcp_redirect(redirect: RedirectConfig) -> std::io::Result<()> {
         redirect.shaping(),
     );
 
-    proxy::run(config, plugins).await
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    let _ = ready.send(());
+    proxy::run_with_listener(config, listener, plugins).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[tokio::test]
+    async fn a_failed_redirect_stops_other_redirects() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { Err(std::io::Error::other("bind failed")) });
+        tasks.spawn(async { std::future::pending::<std::io::Result<()>>().await });
+        let failed = tokio::time::timeout(Duration::from_millis(100), wait_for_tasks(&mut tasks))
+            .await
+            .expect("a failed listener must stop the service");
+        assert!(failed);
+    }
 
     #[test]
     fn accepts_repeated_targets_in_order() {

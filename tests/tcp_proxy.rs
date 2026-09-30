@@ -264,3 +264,47 @@ async fn existing_connection_stays_pinned_while_new_connection_fails_back() {
     let mut client_b = TcpStream::connect(proxy.addr).await.unwrap();
     assert_tagged_reply(&mut client_b, b'P', b"new").await;
 }
+
+/// The worker child reports byte counts back over its stats socket; after
+/// a connection that moved a known amount of data closes, the redirect's
+/// lifetime totals must match exactly.
+#[tokio::test]
+async fn worker_reports_byte_totals_to_registry() {
+    let backend = spawn_echo_backend().await;
+    let proxy = spawn_proxy(
+        "traffic-e2e",
+        vec![backend],
+        Duration::from_secs(1),
+        Vec::new(),
+    )
+    .await;
+
+    let mut client = TcpStream::connect(proxy.addr).await.unwrap();
+    let payload = vec![b'a'; 900];
+    client.write_all(&payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    client.read_exact(&mut echoed).await.unwrap();
+    client.shutdown().await.unwrap();
+    drop(client);
+
+    let totals = timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, stats) = redir_rust::connections::snapshots();
+            let entry = stats["redirects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == "traffic-e2e")
+                .cloned();
+            if let Some(entry) = entry {
+                if entry["connections"] == 0 && entry["up_total"] == 900 {
+                    return entry;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("totals never reached the expected values");
+    assert_eq!(totals["down_total"], 900);
+}

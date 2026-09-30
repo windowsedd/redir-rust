@@ -7,6 +7,39 @@ is down (e.g. a Minecraft "server offline" MOTD).
 
 ## Usage
 
+Run `redir-rust` without arguments to open a terminal menu with Start, Stop,
+Setup Config, Edit Config, Status, Monitor, Open GUI, and Exit. Run `redir-rust --gui`
+to open the graphical manager directly in your browser. The GUI listens on all
+IPv4 interfaces by default, on an automatic port. It prints a per-run access
+URL with a detected network IP when available. Use `--gui-bind IP:PORT` to select a
+specific interface and port. Keep the access URL private because it grants
+config and service control. The GUI uses HTTP, so use it on a trusted LAN or
+behind HTTPS. The GUI closes
+when the command exits. It can add and remove redirects,
+edit validated TOML, and control the service. Setup Config guides you through a
+named TCP or UDP redirect: public listen address and port, one or more backend
+addresses and ports in failover order, timeout, and an optional offline MOTD
+plugin checkbox. Review the settings before saving. On Linux Start and Stop
+control the systemd service. On Windows they control a background process using
+the config selected by `settings.json`; its PID stays in `%APPDATA%\redir-rust`
+and its log is stored beside the selected config.
+
+📝 **Edit Config** lists the service names from the selected config file,
+then lets you edit the listen IP/port, ordered destinations, service name,
+TCP/UDP protocol, or timeout. Choose **⬅ Previous** (or press Esc) to go back;
+at value prompts, type `back` to discard the pending change. Menus support
+arrow keys on a terminal and numbered choices when piped. Each change has a
+review/save prompt and is validated before writing; other service blocks are
+preserved. **🛠 Advanced editor** opens the selected named service in `$EDITOR`
+for plugin text and other options (the full file for an unnamed service).
+Restart redir-rust after saving to apply the changes. `-e` / `--edit-config`
+still opens the full config in your editor directly.
+
+Run `redir-rust --monitor` to view live connections and traffic in a terminal.
+The dashboard reads the running service's snapshots in `/run/redir-rust/` once
+per second. Press Tab to filter by redirect, Up/Down to select a connection,
+`s` to sort, or `q` to quit.
+
 Run a single redirect from CLI flags:
 
 ```sh
@@ -27,8 +60,35 @@ Or run one or more redirects defined in a TOML file (see `config.example.toml`):
 cargo run -- --config config.toml
 ```
 
-When `--config` is present it takes precedence; redirect flags such as
-`--listen` and `--target` are accepted but ignored.
+In run mode, `--config` selects the file and rejects redirect flags such as
+`--listen` and `--target` so no setting is silently ignored.
+
+Manage named redirects in a config file:
+
+```sh
+redir-rust --add --name survival --listen 0.0.0.0:25565 --target 127.0.0.1:25566
+redir-rust --edit survival
+redir-rust --remove survival
+```
+
+`--add` accepts the same redirect flags as direct run mode, including repeated
+`--target`. `--edit NAME` opens only that redirect in `$EDITOR` and validates
+the complete file before saving. Duplicate names are rejected. These commands
+do not restart a running instance. The config location is set in
+`/etc/local/redir-rust/settings.json` on Linux or
+`%APPDATA%\redir-rust\settings.json` on Windows:
+
+```json
+{"config_path": "config.toml"}
+```
+
+Relative paths are resolved beside `settings.json`; absolute paths also work.
+If the settings file is missing, the config defaults to `config.toml` in that
+directory. The Linux installer creates `settings.json` and the config file;
+on Windows, copy `settings.example.json` to the path above to change the
+location. `--settings FILE` chooses another settings file, and `--config FILE`
+overrides its `config_path`. If you used the older Linux path, move your config
+to the new path before starting the service.
 
 Pass `--debug` for verbose logging (shorthand for `RUST_LOG=debug`; an
 explicit `RUST_LOG` env var still takes precedence). See all available flags:
@@ -116,10 +176,18 @@ Equivalent CLI flags (single-redirect mode only):
 ![Java server list showing the offline MOTD](assets/Java_serverlist.png)
 ![Java disconnect screen shown on a join attempt](assets/Java_disconnect.png)
 
-**Protocol support**: version-agnostic. Java Edition's Login Disconnect packet
-uses a length-prefixed JSON reason across supported protocol versions. NBT
-components used by disconnect packets in later protocol states do not apply
-to this login-state response.
+**Protocol support**: Java Edition **1.8 through 26.3** (the latest stable
+release checked on 2026-09-30), including patch releases. Socket tests cover
+all 50 distinct release protocol numbers in that range: status/MOTD replies,
+ping/pong, direct joins, and transferred joins (introduced in 1.20.5).
+This is packet-level coverage, not a test run of every game client.
+
+The plugin uses the shared status and login wire formats without restricting
+the client's version number. Login Disconnect uses a length-prefixed JSON
+reason; NBT components in later protocol states do not apply here. Future
+releases retaining these formats should work, but are not guaranteed. Clients
+older than 1.7 use an unimplemented legacy protocol. Normal forwarding does
+not translate versions; the backend must accept the connecting client.
 
 ### `bedrock` — Bedrock Edition offline MOTD (UDP)
 
@@ -222,8 +290,10 @@ curl -fsSL https://raw.githubusercontent.com/windowsedd/redir-rust/main/install.
 It defaults to the latest release and the static musl build (works on any
 glibc version). Options: `--version v0.1.0`, `--target x86_64-unknown-linux-gnu`,
 `--bin-dir /opt/bin`, `--no-service` to skip the systemd setup, `--help`.
-Re-run it to upgrade in place; an existing `/etc/redir-rust/config.toml` is
-left alone.
+On a fresh install it creates an inactive config and leaves the service stopped;
+add a redirect, then run `sudo systemctl enable --now redir-rust` if it should
+start on boot. Re-running the installer leaves an existing
+`/etc/local/redir-rust/config.toml` alone.
 
 Building from a checkout instead is
 [`packaging/systemd/install.sh`](packaging/systemd/install.sh).

@@ -4,10 +4,12 @@
 //! able to spawn the compiled binary as a subprocess.
 
 pub mod config;
+pub mod config_manager;
 pub mod conn_worker;
 pub mod connections;
 pub mod edit_config;
 pub mod install;
+pub mod monitor;
 pub mod notify;
 pub mod plugin;
 pub mod plugins;
@@ -18,3 +20,5 @@ pub mod shaping;
 pub mod status;
 pub mod udp_proxy;
 pub mod version;
+#[cfg(windows)]
+pub mod windows_process;

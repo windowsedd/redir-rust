@@ -38,7 +38,10 @@ pub fn run(path: &Path) -> ExitCode {
 
     match FileConfig::load(path) {
         Ok(config) => println!("config OK ({} redirect(s))", config.redirects.len()),
-        Err(err) => eprintln!("warning: config has an error: {err}"),
+        Err(err) => {
+            eprintln!("error: config has an error: {err}");
+            return ExitCode::FAILURE;
+        }
     }
 
     ExitCode::SUCCESS
@@ -56,7 +59,7 @@ fn ensure_exists(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-enum EditorOutcome {
+pub(crate) enum EditorOutcome {
     Ran(std::process::ExitStatus),
     NoneFound(Vec<String>),
 }
@@ -89,7 +92,7 @@ fn editor_candidates() -> Vec<String> {
 /// one when the current one isn't installed (`NotFound`) -- a real launch
 /// failure (e.g. permission denied) is surfaced immediately instead of
 /// being masked by silently trying the next candidate.
-fn launch_editor(path: &Path) -> io::Result<EditorOutcome> {
+pub(crate) fn launch_editor(path: &Path) -> io::Result<EditorOutcome> {
     let candidates = editor_candidates();
     for editor in &candidates {
         match Command::new(editor).arg(path).status() {

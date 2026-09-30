@@ -23,11 +23,11 @@ fn default_status_line() -> String {
     "\u{00A7}c伺服器無法連線！ / Server unreachable!".to_string()
 }
 
-fn default_motd_line1() -> String {
+pub fn default_motd_line1() -> String {
     "\u{00A7}c伺服器無法連線！ / Server unreachable!".to_string()
 }
 
-fn default_motd_line2() -> String {
+pub fn default_motd_line2() -> String {
     "\u{00A7}e請稍後再試 / Please Try Again".to_string()
 }
 
@@ -262,7 +262,8 @@ fn build_login_disconnect_payload(kick_text: &str) -> Vec<u8> {
 
 async fn handle_slp(stream: &mut TcpStream, status_json: &str, kick_text: &str) -> io::Result<()> {
     // Handshake packet (id 0x00). Its `next_state` field distinguishes a
-    // server-list status ping (1) from an actual join attempt (2, login).
+    // server-list status ping (1), direct login (2), or transferred login
+    // (3, introduced in Java 1.20.5). Both login intents use Login Disconnect.
     let (packet_id, handshake_body) = read_packet(stream).await?;
     if packet_id != 0x00 {
         return Err(io::Error::new(
@@ -271,13 +272,14 @@ async fn handle_slp(stream: &mut TcpStream, status_json: &str, kick_text: &str) 
         ));
     }
 
-    let (_, next_state) = parse_handshake(&handshake_body)?;
+    let (protocol_version, next_state) = parse_handshake(&handshake_body)?;
     match next_state {
         1 => handle_status(stream, status_json).await,
         2 => handle_login(stream, kick_text).await,
+        3 if protocol_version >= 766 => handle_login(stream, kick_text).await,
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("handshake requested next_state={next_state}, not status or login"),
+            format!("unsupported handshake intent {next_state} for protocol {protocol_version}"),
         )),
     }
 }
@@ -331,6 +333,182 @@ async fn handle_login(stream: &mut TcpStream, kick_text: &str) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Distinct release protocols from PrismarineJS/minecraft-data's
+    // data/pc/common/protocolVersions.json, checked 2026-09-30.
+    // Patch releases sharing a protocol exercise the same wire format.
+    const RELEASE_PROTOCOLS: &[(i32, &str)] = &[
+        (
+            47,
+            "1.8, 1.8.1, 1.8.2, 1.8.3, 1.8.4, 1.8.5, 1.8.6, 1.8.7, 1.8.8, 1.8.9",
+        ),
+        (107, "1.9"),
+        (108, "1.9.1"),
+        (109, "1.9.2"),
+        (110, "1.9.3, 1.9.4"),
+        (210, "1.10, 1.10.1, 1.10.2"),
+        (315, "1.11"),
+        (316, "1.11.1, 1.11.2"),
+        (335, "1.12"),
+        (338, "1.12.1"),
+        (340, "1.12.2"),
+        (393, "1.13"),
+        (401, "1.13.1"),
+        (404, "1.13.2"),
+        (477, "1.14"),
+        (480, "1.14.1"),
+        (485, "1.14.2"),
+        (490, "1.14.3"),
+        (498, "1.14.4"),
+        (573, "1.15"),
+        (575, "1.15.1"),
+        (578, "1.15.2"),
+        (735, "1.16"),
+        (736, "1.16.1"),
+        (751, "1.16.2"),
+        (753, "1.16.3"),
+        (754, "1.16.4, 1.16.5"),
+        (755, "1.17"),
+        (756, "1.17.1"),
+        (757, "1.18, 1.18.1"),
+        (758, "1.18.2"),
+        (759, "1.19"),
+        (760, "1.19.1, 1.19.2"),
+        (761, "1.19.3"),
+        (762, "1.19.4"),
+        (763, "1.20, 1.20.1"),
+        (764, "1.20.2"),
+        (765, "1.20.3, 1.20.4"),
+        (766, "1.20.5, 1.20.6"),
+        (767, "1.21, 1.21.1"),
+        (768, "1.21.2, 1.21.3"),
+        (769, "1.21.4"),
+        (770, "1.21.5"),
+        (771, "1.21.6"),
+        (772, "1.21.7, 1.21.8"),
+        (773, "1.21.9, 1.21.10"),
+        (774, "1.21.11"),
+        (775, "26.1, 26.1.1, 26.1.2"),
+        (776, "26.2"),
+        (777, "26.3"),
+    ];
+
+    fn client_handshake(protocol: i32, intent: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_varint(&mut body, protocol);
+        body.push(9);
+        body.extend_from_slice(b"localhost");
+        body.extend_from_slice(&25565u16.to_be_bytes());
+        write_varint(&mut body, intent);
+        frame_packet(0, &body)
+    }
+
+    fn client_login_start(protocol: i32) -> Vec<u8> {
+        let mut body = vec![6];
+        body.extend_from_slice(b"Player");
+        if protocol == 759 || protocol == 760 {
+            body.push(0); // No optional signature data (1.19 / 1.19.1-2).
+        }
+        if (760..=763).contains(&protocol) {
+            body.push(1); // Optional UUID is present (1.19.1 through 1.20.1).
+        }
+        if protocol >= 760 {
+            body.extend_from_slice(&[0x11; 16]);
+        }
+        frame_packet(0, &body)
+    }
+
+    async fn offline_peer() -> (TcpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let status = build_status_json("offline", "line1", "line2", None);
+            handle_slp(&mut stream, &status, "Server offline\n請稍後再試").await
+        });
+        (TcpStream::connect(addr).await.unwrap(), task)
+    }
+
+    async fn check_offline_login(protocol: i32, intent: i32, releases: &str) {
+        let (mut client, task) = offline_peer().await;
+        let mut request = client_handshake(protocol, intent);
+        request.extend_from_slice(&client_login_start(protocol));
+        client.write_all(&request).await.unwrap();
+        // Check the entire wire response independently, including packet id,
+        // length prefixes, JSON (not NBT), UTF-8 text and connection closure.
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let reason = b"{\"text\":\"Server offline\\n\xe8\xab\x8b\xe7\xa8\x8d\xe5\xbe\x8c\xe5\x86\x8d\xe8\xa9\xa6\"}";
+        let mut expected = vec![(reason.len() + 2) as u8, 0, reason.len() as u8];
+        expected.extend_from_slice(reason);
+        assert_eq!(response, expected, "{releases}, intent {intent}");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_login_supports_java_1_8_through_26_3() {
+        for &(protocol, releases) in RELEASE_PROTOCOLS {
+            check_offline_login(protocol, 2, releases).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_transfer_supports_java_1_20_5_through_26_3() {
+        for &(protocol, releases) in RELEASE_PROTOCOLS.iter().filter(|(p, _)| *p >= 766) {
+            check_offline_login(protocol, 3, releases).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_rejects_invalid_intents_and_pre_transfer_protocols() {
+        for (protocol, intent) in [(47, 3), (765, 3), (777, 0), (777, 4)] {
+            let (mut client, task) = offline_peer().await;
+            client
+                .write_all(&client_handshake(protocol, intent))
+                .await
+                .unwrap();
+            let err = timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert!(response.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_status_and_pong_support_java_1_8_through_26_3() {
+        for &(protocol, releases) in RELEASE_PROTOCOLS {
+            let (mut client, task) = offline_peer().await;
+            let mut request = client_handshake(protocol, 1);
+            request.extend_from_slice(&[1, 0]); // Empty Status Request.
+            client.write_all(&request).await.unwrap();
+            let (id, body) = timeout(Duration::from_secs(2), read_packet(&mut client))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(id, 0, "{releases}");
+            let mut cursor = Cursor::new(body.as_slice());
+            let len = read_varint_from_slice(&mut cursor).unwrap() as usize;
+            let start = cursor.position() as usize;
+            assert_eq!(body.len(), start + len, "{releases}");
+            let status: serde_json::Value = serde_json::from_slice(&body[start..]).unwrap();
+            assert_eq!(status["description"]["text"], "line1\nline2", "{releases}");
+            assert_eq!(status["version"]["protocol"], -1, "{releases}");
+            let ping = [9, 1, 0, 1, 2, 3, 4, 5, 6, 7];
+            client.write_all(&ping).await.unwrap();
+            let mut pong = [0; 10];
+            client.read_exact(&mut pong).await.unwrap();
+            assert_eq!(pong, ping, "{releases}");
+            task.await.unwrap().unwrap();
+        }
+    }
 
     #[test]
     fn write_varint_matches_known_encodings() {

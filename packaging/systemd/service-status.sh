@@ -6,11 +6,11 @@
 #
 # Usage: service-status.sh <unit-name> [config-file]
 #   unit-name    default: redir-rust.service
-#   config-file  default: /etc/redir-rust/config.toml
+#   config-file  default: /etc/local/redir-rust/config.toml
 set -euo pipefail
 
 unit="${1:-redir-rust.service}"
-config_file="${2:-/etc/redir-rust/config.toml}"
+config_file="${2:-/etc/local/redir-rust/config.toml}"
 
 status_text="$(systemctl status --no-pager -l "$unit" 2>&1 || true)"
 

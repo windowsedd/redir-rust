@@ -16,7 +16,17 @@ use crate::plugin::Direction;
 /// original `redir`'s `-o`/`--wait-in-out` flag: "in" is client-to-target
 /// traffic flowing in to the target, "out" is target-to-client traffic
 /// flowing back out to the client.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Deserialize,
+    serde::Serialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum WaitInOut {

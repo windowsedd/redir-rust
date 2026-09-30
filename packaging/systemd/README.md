@@ -1,7 +1,7 @@
 # systemd service
 
 Installs `redir-rust` as a systemd service that reads its redirects from
-`/etc/redir-rust/config.toml`.
+`/etc/local/redir-rust/config.toml`.
 
 ## Quick setup
 
@@ -14,11 +14,12 @@ cargo build --release
 sudo ./target/release/redir-rust --install-systemd
 ```
 
-Copies itself to `/usr/local/bin/redir-rust`, drops a default `config.toml`
-into `/etc/redir-rust/` (only if one doesn't already exist), installs the
-unit file, and enables + (re)starts the service. Safe to re-run after
-rebuilding to upgrade — it won't touch an existing config, and it always
-restarts the service so the new binary actually takes effect (the copy
+Copies itself to `/usr/local/bin/redir-rust`, drops an inactive `config.toml`
+into `/etc/local/redir-rust/` (only if one doesn't already exist), and installs the
+unit file. On a fresh install, add a redirect and then run
+`sudo systemctl enable --now redir-rust`;
+re-running with an existing config enables and restarts it. It won't touch an
+existing config. The copy
 itself uses a temp file + atomic rename, so it works even while the old
 binary is running as the current service — a plain overwrite would fail
 with `Text file busy`). Requires root.
@@ -44,9 +45,8 @@ curl -fsSL https://raw.githubusercontent.com/windowsedd/redir-rust/main/install.
 a newer release exists, then restarts the unit (`--unit`, default
 `redir-rust.service`).
 
-`packaging/systemd/install.sh` does the same thing as a standalone shell
-script, if you'd rather not run the binary as an installer (e.g. you want
-to review the exact commands before running as root):
+`packaging/systemd/install.sh` builds from a checkout, then calls the binary's
+installer so both paths use the same config and service behavior:
 
 ```sh
 ./packaging/systemd/install.sh
@@ -59,8 +59,8 @@ Equivalent to what `--install-systemd` does, if you'd rather run the steps yours
 ```sh
 cargo build --release
 sudo install -Dm755 target/release/redir-rust /usr/local/bin/redir-rust
-sudo mkdir -p /etc/redir-rust
-sudo cp config.example.toml /etc/redir-rust/config.toml   # edit to taste
+sudo mkdir -p /etc/local/redir-rust
+sudo cp config.example.toml /etc/local/redir-rust/config.toml   # edit to taste
 sudo install -Dm644 packaging/systemd/redir-rust.service /etc/systemd/system/redir-rust.service
 
 sudo systemctl daemon-reload
@@ -126,38 +126,30 @@ so you don't have to remember the unit name for routine operations.
 ## Editing the config
 
 ```sh
-sudo redir-rust -e                       # edits /etc/redir-rust/config.toml
+sudo redir-rust -e                       # edits /etc/local/redir-rust/config.toml
 sudo redir-rust -e --config ./other.toml # edits a different file
+sudo redir-rust --add --name main --listen 0.0.0.0:25565 --target 127.0.0.1:25566
+sudo redir-rust --edit main              # edits just this redirect
+sudo redir-rust --remove main
 ```
 
 Creates the file from the built-in default template first if it doesn't
 exist yet, opens it in `$EDITOR` (falling back to `$VISUAL`, then
 `nano`/`vi` on Linux or `notepad` on Windows), and re-parses it after the
-editor exits — printing `config OK (N redirect(s))` or a `warning: config
-has an error: ...` so a typo doesn't go unnoticed until the next restart.
+editor exits — printing `config OK (N redirect(s))` or an error with a nonzero
+exit status so a typo doesn't go unnoticed until the next restart.
 Does **not** restart the service itself; follow up with `sudo redir-rust
 --restart` once you're happy with the changes.
 
 ## Machine-readable status
 
-`redir-rust --service-status` (built into the binary) wraps `systemctl
-status` and prints JSON (unit, status, loaded, active, since, main_pid,
-tasks, memory, cpu, cgroup, processes) — handy for a bot/dashboard that
-wants to render a status card instead of parsing `systemctl status` text
-itself. It also loads `[[redirect]]` entries from `--config` (default
-`/etc/redir-rust/config.toml`, using the same TOML parser the service
-itself uses) and probes each TCP target with a 2s connect attempt, so you
-can see per-redirect backend health alongside the service state. UDP
-redirects are listed but not probed (`reachable: null`). It pulls the last
-10 connection-failure-looking lines (`failed`, `refused`, `error`, `timed
-out`, `unreachable`) from `journalctl -u <unit>` into `recent_errors`. And
-it reports **who's connected right now**: the running service maintains a
-live registry of open connections (updated on every connect/disconnect)
-and snapshots it to `/run/redir-rust/connections.json`; `--service-status`
-reads that file directly into `active_connections`.
+`redir-rust --service-status` (built into the binary) prints the raw output of
+`systemctl status --no-pager -l`. For JSON with target checks, recent errors,
+and active connections, use `packaging/systemd/service-status.sh`. The running
+service snapshots active connections to `/run/redir-rust/connections.json`.
 
 ```sh
-redir-rust --service-status --unit redir-rust.service --config /etc/redir-rust/config.toml
+redir-rust --service-status --unit redir-rust.service
 ```
 
 `packaging/systemd/service-status.sh <unit-name> [config-file]` is the
@@ -177,7 +169,7 @@ file for `active_connections`.
   "memory": "1.2M",
   "cpu": "122ms",
   "cgroup": "/system.slice/redir-rust.service",
-  "processes": [{ "pid": 2996715, "command": "/usr/local/bin/redir-rust --config /etc/redir-rust/config.toml" }],
+  "processes": [{ "pid": 2996715, "command": "/usr/local/bin/redir-rust --config /etc/local/redir-rust/config.toml" }],
   "targets": [
     { "name": "minecraft-survival", "listen": "0.0.0.0:25565", "target": "127.0.0.1:25566", "protocol": "tcp", "reachable": true },
     { "name": "bedrock-relay", "listen": "0.0.0.0:19132", "target": "127.0.0.1:19133", "protocol": "udp", "reachable": null }

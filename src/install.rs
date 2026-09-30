@@ -4,12 +4,12 @@
 //! enough to self-install -- no separate script or repo checkout required
 //! on the target host.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 const BIN_NAME: &str = "redir-rust";
-const INSTALL_BIN: &str = "/usr/local/bin/redir-rust";
-const CONFIG_DIR: &str = "/etc/redir-rust";
-const CONFIG_FILE: &str = "/etc/redir-rust/config.toml";
+const CONFIG_DIR: &str = "/etc/local/redir-rust";
+const SETTINGS_FILE: &str = "/etc/local/redir-rust/settings.json";
 const UNIT_FILE: &str = "/etc/systemd/system/redir-rust.service";
 
 const UNIT_TEMPLATE: &str = "\
@@ -21,7 +21,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=/usr/local/bin/redir-rust --config /etc/redir-rust/config.toml
+ExecStart=/usr/local/bin/redir-rust --settings /etc/local/redir-rust/settings.json
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info
@@ -35,8 +35,8 @@ WantedBy=multi-user.target
 ";
 
 #[cfg(unix)]
-pub fn run() -> ExitCode {
-    match unix::try_run() {
+pub fn run(bin_dir: &Path) -> ExitCode {
+    match unix::try_run(bin_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
@@ -46,7 +46,7 @@ pub fn run() -> ExitCode {
 }
 
 #[cfg(not(unix))]
-pub fn run() -> ExitCode {
+pub fn run(_bin_dir: &Path) -> ExitCode {
     eprintln!("error: --install-systemd is only supported on Linux (systemd)");
     ExitCode::FAILURE
 }
@@ -57,8 +57,8 @@ pub fn run() -> ExitCode {
 /// config or unit file (so it won't clobber either if they've been hand-
 /// edited since the initial install).
 #[cfg(unix)]
-pub fn update(unit: &str) -> ExitCode {
-    match unix::try_update(unit) {
+pub fn update(unit: &str, bin_dir: &Path) -> ExitCode {
+    match unix::try_update(unit, bin_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
@@ -68,43 +68,65 @@ pub fn update(unit: &str) -> ExitCode {
 }
 
 #[cfg(not(unix))]
-pub fn update(_unit: &str) -> ExitCode {
+pub fn update(_unit: &str, _bin_dir: &Path) -> ExitCode {
     eprintln!("error: --update is only supported on Linux (systemd)");
     ExitCode::FAILURE
 }
 
 #[cfg(unix)]
 mod unix {
-    use super::{BIN_NAME, CONFIG_DIR, CONFIG_FILE, INSTALL_BIN, UNIT_FILE, UNIT_TEMPLATE};
+    use super::{BIN_NAME, CONFIG_DIR, SETTINGS_FILE, UNIT_FILE, UNIT_TEMPLATE};
     use crate::config::DEFAULT_CONFIG_TOML;
+    use crate::config_manager;
     use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
 
-    pub fn try_run() -> io::Result<()> {
-        println!("==> Installing binary to {INSTALL_BIN}");
+    pub fn try_run(bin_dir: &Path) -> io::Result<()> {
+        let install_bin = bin_dir.join(BIN_NAME);
+        println!("==> Installing binary to {}", install_bin.display());
         let current_exe = std::env::current_exe()?;
-        if let Some(parent) = Path::new(INSTALL_BIN).parent() {
-            fs::create_dir_all(parent).map_err(hint_sudo)?;
-        }
-        install_binary(&current_exe).map_err(hint_sudo)?;
+        fs::create_dir_all(bin_dir).map_err(hint_sudo)?;
+        install_binary(&current_exe, &install_bin).map_err(hint_sudo)?;
 
-        println!("==> Ensuring config at {CONFIG_FILE}");
         fs::create_dir_all(CONFIG_DIR).map_err(hint_sudo)?;
-        if Path::new(CONFIG_FILE).exists() {
+        if !Path::new(SETTINGS_FILE).exists() {
+            fs::write(SETTINGS_FILE, "{\n  \"config_path\": \"config.toml\"\n}\n")?;
+            println!("    created settings at {SETTINGS_FILE}");
+        }
+        let config_path = config_manager::configured_path(Path::new(SETTINGS_FILE))?;
+        println!("==> Ensuring config at {}", config_path.display());
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let fresh_config = !config_path.exists();
+        if !fresh_config {
             println!("    already exists, leaving it alone");
         } else {
-            fs::write(CONFIG_FILE, DEFAULT_CONFIG_TOML)?;
-            println!("    installed default config -- edit {CONFIG_FILE} before relying on it");
+            fs::write(&config_path, DEFAULT_CONFIG_TOML)?;
+            println!(
+                "    created inactive config -- edit {} before starting the service",
+                config_path.display()
+            );
         }
 
         println!("==> Installing unit file to {UNIT_FILE}");
-        fs::write(UNIT_FILE, UNIT_TEMPLATE).map_err(hint_sudo)?;
+        let unit =
+            UNIT_TEMPLATE.replace("/usr/local/bin/redir-rust", &install_bin.to_string_lossy());
+        fs::write(UNIT_FILE, unit).map_err(hint_sudo)?;
 
-        println!("==> Reloading systemd and (re)starting the service");
+        println!("==> Reloading systemd");
         run_cmd("systemctl", &["daemon-reload"])?;
+        if fresh_config {
+            println!(
+                "==> Service not started; configure {} first",
+                config_path.display()
+            );
+            return Ok(());
+        }
+        println!("==> Enabling and (re)starting the service");
         run_cmd("systemctl", &["enable", BIN_NAME])?;
         // `restart` (not `enable --now`) so re-running this after an
         // upgrade actually picks up the new binary -- `--now` is a no-op
@@ -118,10 +140,12 @@ mod unix {
         Ok(())
     }
 
-    pub fn try_update(unit: &str) -> io::Result<()> {
-        println!("==> Installing binary to {INSTALL_BIN}");
+    pub fn try_update(unit: &str, bin_dir: &Path) -> io::Result<()> {
+        let install_bin = bin_dir.join(BIN_NAME);
+        println!("==> Installing binary to {}", install_bin.display());
         let current_exe = std::env::current_exe()?;
-        install_binary(&current_exe).map_err(hint_sudo)?;
+        fs::create_dir_all(bin_dir).map_err(hint_sudo)?;
+        install_binary(&current_exe, &install_bin).map_err(hint_sudo)?;
 
         println!("==> Restarting {unit}");
         run_cmd("systemctl", &["restart", unit])?;
@@ -140,11 +164,11 @@ mod unix {
     /// file busy"): Linux refuses to open-and-truncate a binary that's
     /// currently mapped/executing. `rename()` just repoints the directory
     /// entry to a new inode, which works even while the old one is running.
-    fn install_binary(src: &Path) -> io::Result<()> {
-        let tmp_path = format!("{INSTALL_BIN}.new");
+    fn install_binary(src: &Path, dest: &Path) -> io::Result<()> {
+        let tmp_path = dest.with_extension("new");
         fs::copy(src, &tmp_path)?;
         fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
-        fs::rename(&tmp_path, INSTALL_BIN)?;
+        fs::rename(&tmp_path, dest)?;
         Ok(())
     }
 

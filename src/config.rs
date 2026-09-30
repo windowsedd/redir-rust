@@ -2,23 +2,26 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::shaping::{ShapingConfig, WaitInOut};
 
-/// Default config dropped in place by `--install-systemd` and `--edit-config`
-/// when no config file exists yet.
-pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config.example.toml");
+/// Inactive starter config used by `--install-systemd` and `--edit-config`.
+/// Example listeners stay in `config.example.toml` and are never auto-started.
+pub const DEFAULT_CONFIG_TOML: &str =
+    "# Add a [[redirect]] before starting redir-rust.\n# See config.example.toml for examples.\n";
 
 /// Top-level shape of a `config.toml` file: one or more independent redirects,
 /// each with its own listen/target pair and plugin settings.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(rename = "redirect", default)]
     pub redirects: Vec<RedirectConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedirectConfig {
     /// Optional label used in logs to identify this redirect. Defaults to
     /// a description of the listen address and ordered target(s) if unset.
@@ -75,7 +78,7 @@ pub struct RedirectConfig {
     pub bufsize_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TargetConfig {
     #[serde(default)]
     target: Option<SocketAddr>,
@@ -163,7 +166,7 @@ impl RedirectConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
 pub enum Protocol {
@@ -175,13 +178,15 @@ pub enum Protocol {
 /// Minecraft-specific settings for a redirect, namespaced so future
 /// protocol-specific plugins can live alongside `plugins` without cluttering
 /// the top-level redirect table.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MinecraftConfig {
     #[serde(default)]
     pub plugins: Option<MinecraftPluginsConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MinecraftPluginsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -207,13 +212,15 @@ pub struct MinecraftPluginsConfig {
 
 /// Bedrock-specific settings for a UDP redirect, namespaced to mirror
 /// `[redirect.minecraft]` for the TCP (Java edition) plugin.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
     #[serde(default)]
     pub plugins: Option<BedrockPluginsConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BedrockPluginsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -248,12 +255,26 @@ impl FileConfig {
         let path = path.as_ref();
         let contents = std::fs::read_to_string(path)
             .map_err(|err| ConfigError::Read(path.display().to_string(), err))?;
-        let config: FileConfig = toml::from_str(&contents)
-            .map_err(|err| ConfigError::Parse(path.display().to_string(), err))?;
+        Self::parse(&contents, path.display().to_string())
+    }
+
+    pub fn parse_str(contents: &str) -> Result<Self, ConfigError> {
+        Self::parse(contents, "<config>".to_string())
+    }
+
+    fn parse(contents: &str, source: String) -> Result<Self, ConfigError> {
+        let config: FileConfig =
+            toml::from_str(contents).map_err(|err| ConfigError::Parse(source.clone(), err))?;
         if config.redirects.is_empty() {
-            return Err(ConfigError::Empty(path.display().to_string()));
+            return Err(ConfigError::Empty(source));
         }
+        let mut names = std::collections::HashSet::new();
         for redirect in &config.redirects {
+            if let Some(name) = &redirect.name {
+                if name.trim().is_empty() || !names.insert(name.as_str()) {
+                    return Err(ConfigError::InvalidName(name.clone()));
+                }
+            }
             let target_error = match (
                 &redirect.target_config.target,
                 &redirect.target_config.targets,
@@ -288,11 +309,48 @@ pub enum ConfigError {
     Empty(String),
     #[error("redirect {0} has invalid targets: {1}")]
     InvalidTargets(String, String),
+    #[error("redirect name {0:?} is empty or duplicated")]
+    InvalidName(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_default_does_not_define_live_listeners() {
+        let config: FileConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert!(config.redirects.is_empty());
+    }
+
+    #[test]
+    fn shipped_example_is_still_valid() {
+        let example = include_str!("../config.example.toml");
+        assert_eq!(FileConfig::parse_str(example).unwrap().redirects.len(), 4);
+    }
+
+    #[test]
+    fn rejects_misspelled_redirect_setting() {
+        let path =
+            std::env::temp_dir().join(format!("redir-rust-unknown-{}.toml", std::process::id()));
+        std::fs::write(&path, "[[redirect]]\nlisten = '127.0.0.1:1'\ntarget = '127.0.0.1:2'\nconnect_timout_ms = 20\n").unwrap();
+        let result = FileConfig::load(&path);
+        std::fs::remove_file(path).ok();
+        assert!(
+            result.is_err(),
+            "unknown settings must not silently use defaults"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_redirect_names() {
+        let path =
+            std::env::temp_dir().join(format!("redir-rust-duplicates-{}.toml", std::process::id()));
+        std::fs::write(&path, "[[redirect]]\nname = 'same'\nlisten = '127.0.0.1:1'\ntarget = '127.0.0.1:2'\n[[redirect]]\nname = 'same'\nlisten = '127.0.0.1:3'\ntarget = '127.0.0.1:4'\n").unwrap();
+        let result = FileConfig::load(&path);
+        std::fs::remove_file(path).ok();
+        assert!(result.is_err(), "duplicate names must be rejected");
+    }
 
     #[test]
     fn parses_ordered_targets() {

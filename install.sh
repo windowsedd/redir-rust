@@ -3,7 +3,7 @@
 #
 # Downloads a published release binary, verifies its sha256, installs it, and
 # (unless --no-service) hands off to the binary's own --install-systemd to set
-# up /etc/redir-rust/config.toml and the systemd unit. No Rust toolchain and
+# up /etc/local/redir-rust/config.toml and the systemd unit. No Rust toolchain and
 # no repo checkout needed.
 #
 #   curl -fsSL https://raw.githubusercontent.com/windowsedd/redir-rust/main/install.sh | sudo bash
@@ -126,14 +126,15 @@ else
     # The binary embeds the unit file and the default config, so it can finish
     # the install itself — one source of truth for both install paths.
     info "Setting up the systemd service"
-    $SUDO "${bin_dir}/${BIN_NAME}" --install-systemd
+    $SUDO "${bin_dir}/${BIN_NAME}" --install-systemd --bin-dir "$bin_dir"
 fi
 
 info "Installed $("${bin_dir}/${BIN_NAME}" -V)"
 cat <<EOF
 
 Next steps:
-  sudo ${BIN_NAME} -e            # edit /etc/redir-rust/config.toml
-  sudo ${BIN_NAME} --restart     # apply the config
+  sudo ${BIN_NAME} -e            # edit /etc/local/redir-rust/config.toml
+  sudo systemctl enable --now ${BIN_NAME}  # after adding a redirect
+  sudo ${BIN_NAME} --restart     # apply later config changes
   sudo ${BIN_NAME} --service-status
 EOF

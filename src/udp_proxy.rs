@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,9 @@ const MAX_PENDING_CLIENTS: usize = 1_024;
 const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FAKE_SESSIONS: usize = 1_024;
 const PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const REACHABILITY_UNKNOWN: u8 = 0;
+const REACHABILITY_UP: u8 = 1;
+const REACHABILITY_DOWN: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct UdpProxyConfig {
@@ -38,6 +41,7 @@ pub struct UdpProxyConfig {
 struct Session {
     socket: Arc<UdpSocket>,
     last_seen: Arc<StdMutex<Instant>>,
+    traffic: connections::TrafficHandle,
     _tracking: connections::ConnectionGuard,
 }
 
@@ -192,25 +196,27 @@ async fn run_loop(config: UdpProxyConfig, listener: Arc<UdpSocket>) -> io::Resul
                 }
 
                 if let Some(reachable) = &target_reachable {
-                    if !reachable.load(Ordering::Relaxed)
+                    if reachable.load(Ordering::Relaxed) == REACHABILITY_DOWN
                         && handle_offline_datagram(&listener, &config, &mut fake_sessions, client_addr, datagram).await
                     {
                         continue;
                     }
                 }
 
-                if let Some(socket) = existing_session(&sessions, client_addr).await {
-                    if let Err(err) = socket.send(datagram).await {
-                        warn!(client = %client_addr, %err, "failed to forward udp datagram to target");
+                if let Some((socket, traffic)) = existing_session(&sessions, client_addr).await {
+                    match socket.send(datagram).await {
+                        Ok(n) => traffic.add_up(n as u64),
+                        Err(err) => warn!(client = %client_addr, %err, "failed to forward udp datagram to target"),
                     }
                     continue;
                 }
 
                 if config.targets.len() == 1 {
                     match create_session(&sessions, &listener, &config, client_addr, config.targets[0]).await {
-                        Ok(socket) => {
-                            if let Err(err) = socket.send(datagram).await {
-                                warn!(client = %client_addr, %err, "failed to forward udp datagram to target");
+                        Ok((socket, traffic)) => {
+                            match socket.send(datagram).await {
+                                Ok(n) => traffic.add_up(n as u64),
+                                Err(err) => warn!(client = %client_addr, %err, "failed to forward udp datagram to target"),
                             }
                         }
                         Err(err) => warn!(client = %client_addr, %err, "failed to open udp session"),
@@ -263,10 +269,11 @@ async fn run_loop(config: UdpProxyConfig, listener: Arc<UdpSocket>) -> io::Resul
 
                 if let Some(target_addr) = result.target_addr {
                     match create_session(&sessions, &listener, &config, result.client_addr, target_addr).await {
-                        Ok(socket) => {
+                        Ok((socket, traffic)) => {
                             debug!(client = %result.client_addr, target = %target_addr, "udp target selected");
                             flush_queued_datagrams(
                                 &socket,
+                                &traffic,
                                 queued,
                                 result.client_addr,
                                 target_addr,
@@ -314,13 +321,17 @@ fn spawn_target_selection(
 
 async fn flush_queued_datagrams(
     socket: &UdpSocket,
+    traffic: &connections::TrafficHandle,
     queued: VecDeque<Vec<u8>>,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
 ) {
     for datagram in queued {
-        if let Err(err) = socket.send(&datagram).await {
-            warn!(client = %client_addr, target = %target_addr, %err, "failed to forward queued udp datagram to target");
+        match socket.send(&datagram).await {
+            Ok(n) => traffic.add_up(n as u64),
+            Err(err) => {
+                warn!(client = %client_addr, target = %target_addr, %err, "failed to forward queued udp datagram to target")
+            }
         }
     }
 }
@@ -386,26 +397,31 @@ fn can_start_fake_session(
     fake_sessions.contains_key(&client_addr) || fake_sessions.len() < MAX_FAKE_SESSIONS
 }
 
-fn spawn_reachability_prober(target_addr: SocketAddr, probe_timeout: Duration) -> Arc<AtomicBool> {
-    let reachable = Arc::new(AtomicBool::new(false));
+fn spawn_reachability_prober(target_addr: SocketAddr, probe_timeout: Duration) -> Arc<AtomicU8> {
+    let reachable = Arc::new(AtomicU8::new(REACHABILITY_UNKNOWN));
     let flag = reachable.clone();
     tokio::spawn(async move {
         loop {
-            flag.store(
-                bedrock_offline::probe_target(target_addr, probe_timeout).await,
-                Ordering::Relaxed,
-            );
+            let state = if bedrock_offline::probe_target(target_addr, probe_timeout).await {
+                REACHABILITY_UP
+            } else {
+                REACHABILITY_DOWN
+            };
+            flag.store(state, Ordering::Relaxed);
             tokio::time::sleep(PROBE_INTERVAL).await;
         }
     });
     reachable
 }
 
-async fn existing_session(sessions: &Sessions, client_addr: SocketAddr) -> Option<Arc<UdpSocket>> {
+async fn existing_session(
+    sessions: &Sessions,
+    client_addr: SocketAddr,
+) -> Option<(Arc<UdpSocket>, connections::TrafficHandle)> {
     let sessions_guard = sessions.lock().await;
     let session = sessions_guard.get(&client_addr)?;
     *session.last_seen.lock().unwrap() = Instant::now();
-    Some(session.socket.clone())
+    Some((session.socket.clone(), session.traffic.clone()))
 }
 
 async fn create_session(
@@ -414,7 +430,7 @@ async fn create_session(
     config: &UdpProxyConfig,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
-) -> io::Result<Arc<UdpSocket>> {
+) -> io::Result<(Arc<UdpSocket>, connections::TrafficHandle)> {
     let bind_addr = if target_addr.is_ipv6() {
         "[::]:0"
     } else {
@@ -427,13 +443,15 @@ async fn create_session(
 
     let mut sessions_guard = sessions.lock().await;
     if let Some(existing) = sessions_guard.get(&client_addr) {
-        return Ok(existing.socket.clone());
+        return Ok((existing.socket.clone(), existing.traffic.clone()));
     }
+    let traffic = tracking.traffic();
     sessions_guard.insert(
         client_addr,
         Session {
             socket: target_socket.clone(),
             last_seen: last_seen.clone(),
+            traffic: traffic.clone(),
             _tracking: tracking,
         },
     );
@@ -446,9 +464,10 @@ async fn create_session(
         client_addr,
         sessions.clone(),
         last_seen,
+        traffic.clone(),
         config.idle_timeout,
     );
-    Ok(target_socket)
+    Ok((target_socket, traffic))
 }
 
 fn spawn_return_path(
@@ -457,6 +476,7 @@ fn spawn_return_path(
     client_addr: SocketAddr,
     sessions: Sessions,
     last_seen: Arc<StdMutex<Instant>>,
+    traffic: connections::TrafficHandle,
     idle_timeout: Duration,
 ) {
     tokio::spawn(async move {
@@ -466,9 +486,12 @@ fn spawn_return_path(
             match timeout(idle_timeout, target_socket.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
                     *last_seen.lock().unwrap() = Instant::now();
-                    if let Err(err) = listener.send_to(&buf[..n], client_addr).await {
-                        warn!(client = %client_addr, %err, "failed to forward udp datagram to client");
-                        break "forward to client failed";
+                    match listener.send_to(&buf[..n], client_addr).await {
+                        Ok(sent) => traffic.add_down(sent as u64),
+                        Err(err) => {
+                            warn!(client = %client_addr, %err, "failed to forward udp datagram to client");
+                            break "forward to client failed";
+                        }
                     }
                 }
                 Ok(Err(err)) => {
@@ -525,15 +548,17 @@ mod tests {
         last_seen: Arc<StdMutex<Instant>>,
         client_addr: SocketAddr,
     ) -> Session {
+        let tracking = connections::track(
+            "udp-cleanup-test",
+            "udp",
+            client_addr,
+            "127.0.0.1:9".parse().unwrap(),
+        );
         Session {
             socket,
             last_seen,
-            _tracking: connections::track(
-                "udp-cleanup-test",
-                "udp",
-                client_addr,
-                "127.0.0.1:9".parse().unwrap(),
-            ),
+            traffic: tracking.traffic(),
+            _tracking: tracking,
         }
     }
 
@@ -631,7 +656,9 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let queued = VecDeque::from([vec![0; 70_000], b"after-failure".to_vec()]);
 
-        flush_queued_datagrams(&sender, queued, client_addr, target_addr).await;
+        let guard = connections::track("udp-flush-test", "udp", client_addr, target_addr);
+        let traffic = guard.traffic();
+        flush_queued_datagrams(&sender, &traffic, queued, client_addr, target_addr).await;
 
         let mut buf = [0u8; 32];
         let n = timeout(Duration::from_secs(1), receiver.recv(&mut buf))

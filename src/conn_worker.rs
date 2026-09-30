@@ -41,8 +41,9 @@ pub async fn run(
     plugins: &[std::sync::Arc<dyn crate::plugin::Plugin>],
     shaping: Option<&crate::shaping::ShapingConfig>,
     _worker_executable: Option<&std::path::Path>,
+    traffic: Option<crate::connections::TrafficHandle>,
 ) -> std::io::Result<()> {
-    crate::proxy::pipe(client, target, plugins, shaping).await
+    crate::proxy::pipe(client, target, plugins, shaping, traffic).await
 }
 
 #[cfg(not(unix))]
@@ -56,10 +57,53 @@ pub fn run_worker() -> std::process::ExitCode {
 mod unix {
     use std::io;
     use std::net::Shutdown;
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{ExitCode, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
+
+    use crate::connections::TrafficHandle;
+
+    /// fd the worker inherits its stats socket on, announced to it with
+    /// `--stats-fd 3` so it never touches an fd the parent did not set up.
+    const STATS_FD: i32 = 3;
+
+    /// Wire format of one worker report: cumulative bytes client->target
+    /// then target->client, little-endian.
+    pub(super) fn encode_counts(up: u64, down: u64) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&up.to_le_bytes());
+        out[8..].copy_from_slice(&down.to_le_bytes());
+        out
+    }
+
+    pub(super) fn decode_counts(bytes: [u8; 16]) -> (u64, u64) {
+        let (up, down) = bytes.split_at(8);
+        (
+            u64::from_le_bytes(up.try_into().unwrap()),
+            u64::from_le_bytes(down.try_into().unwrap()),
+        )
+    }
+
+    /// Counts every byte successfully written through it.
+    struct CountingWriter<W> {
+        inner: W,
+        count: Arc<AtomicU64>,
+    }
+
+    impl<W: io::Write> io::Write for CountingWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.count.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
 
     use tokio::net::TcpStream;
     use tokio::process::Command;
@@ -81,12 +125,35 @@ mod unix {
         _plugins: &[Arc<dyn Plugin>],
         shaping: Option<&ShapingConfig>,
         worker_executable: Option<&std::path::Path>,
+        traffic: Option<TrafficHandle>,
     ) -> io::Result<()> {
         let client_fd: OwnedFd = client.into_std()?.into();
         let target_fd: OwnedFd = target.into_std()?.into();
 
         let mut cmd = Command::new(worker_exe_path(worker_executable)?);
         cmd.arg("--conn-worker");
+
+        // Byte-count side channel: the child end becomes fd 3 in the worker.
+        let (parent_end, child_end) = std::os::unix::net::UnixStream::pair()?;
+        if traffic.is_some() {
+            cmd.arg("--stats-fd").arg(STATS_FD.to_string());
+            let child_raw = child_end.as_raw_fd();
+            // SAFETY: only async-signal-safe libc calls between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if child_raw == STATS_FD {
+                        // dup2 onto itself is a no-op and would leave
+                        // FD_CLOEXEC set, so clear it explicitly.
+                        if libc::fcntl(STATS_FD, libc::F_SETFD, 0) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    } else if libc::dup2(child_raw, STATS_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         if let Some(shaping) = shaping {
             if let Some(bps) = shaping.max_bandwidth_bps {
                 cmd.arg("--max-bandwidth-bps").arg(bps.to_string());
@@ -103,14 +170,41 @@ mod unix {
         // goes to the same journal as the parent's own logs instead of
         // being silently discarded.
 
-        let mut child = cmd.spawn()?;
+        let spawned = cmd.spawn();
+        // Close our copy of the child end so the reader sees EOF as soon as
+        // the worker exits.
+        drop(child_end);
+        let mut child = spawned?;
+        let reader = match traffic {
+            Some(handle) => {
+                parent_end.set_nonblocking(true)?;
+                let stream = tokio::net::UnixStream::from_std(parent_end)?;
+                Some(tokio::spawn(read_reports(stream, handle)))
+            }
+            None => None,
+        };
         let status = child.wait().await?;
+        if let Some(reader) = reader {
+            // The worker's final report is already in the socket buffer;
+            // this just waits for it to be drained.
+            let _ = reader.await;
+        }
         if !status.success() {
             return Err(io::Error::other(format!(
                 "conn-worker child exited with {status}"
             )));
         }
         Ok(())
+    }
+
+    async fn read_reports(mut stream: tokio::net::UnixStream, traffic: TrafficHandle) {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = [0u8; 16];
+        while stream.read_exact(&mut buf).await.is_ok() {
+            let (up, down) = decode_counts(buf);
+            traffic.set_absolute(up, down);
+        }
     }
 
     /// Reconstructs a `ShapingConfig` from the `--max-bandwidth-bps`/
@@ -172,7 +266,29 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::worker_exe_path;
+        use super::{decode_counts, encode_counts, worker_exe_path, CountingWriter};
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        #[test]
+        fn counts_roundtrip_through_wire_format() {
+            let (up, down) = (u64::MAX - 1, 42);
+            assert_eq!(decode_counts(encode_counts(up, down)), (up, down));
+        }
+
+        #[test]
+        fn counting_writer_counts_written_bytes() {
+            let count = Arc::new(AtomicU64::new(0));
+            let mut writer = CountingWriter {
+                inner: Vec::new(),
+                count: count.clone(),
+            };
+            writer.write_all(b"hello").unwrap();
+            writer.write_all(b", world").unwrap();
+            assert_eq!(count.load(Ordering::Relaxed), 12);
+            assert_eq!(writer.inner, b"hello, world");
+        }
 
         #[test]
         fn explicit_worker_executable_takes_precedence() {
@@ -192,6 +308,22 @@ mod unix {
     /// through this path aren't relaying any data; trim it back down once
     /// that's confirmed fixed.
     pub fn run_worker() -> ExitCode {
+        // Read the CLI args before anything calls `proctitle::set`: it
+        // overwrites the argv memory in place, and `std::env::args()` reads
+        // that same memory, so args read afterwards come back garbled.
+        // Args after "--conn-worker" carry shaping settings, if any (see
+        // `run`/`parse_shaping_args`); `None` means an unshaped connection,
+        // which uses a plain `io::copy` fast path below.
+        let mut worker_args: Vec<String> = std::env::args().skip(2).collect();
+        let stats_fd = if worker_args.first().map(String::as_str) == Some("--stats-fd") {
+            let fd = worker_args.get(1).and_then(|v| v.parse::<i32>().ok());
+            worker_args.drain(..worker_args.len().min(2));
+            fd
+        } else {
+            None
+        };
+        let shaping_args = worker_args;
+
         // SAFETY: this mode is only ever reached via `run` above re-
         // exec'ing this same binary with fd 0/1 set to the client/target
         // sockets (see the `Stdio::from` calls there); it's never invoked
@@ -229,14 +361,9 @@ mod unix {
             }
         }
 
-        // Args after "--conn-worker" carry shaping settings, if any (see
-        // `run`/`parse_shaping_args`); `None` means an unshaped connection,
-        // which uses a plain `io::copy` fast path below.
-        let shaping_args: Vec<String> = std::env::args().skip(2).collect();
         let shaping = parse_shaping_args(&shaping_args);
 
-        let (mut client_writer, mut target_writer) = match (client.try_clone(), target.try_clone())
-        {
+        let (client_writer, target_writer) = match (client.try_clone(), target.try_clone()) {
             (Ok(c), Ok(t)) => (c, t),
             (c, t) => {
                 eprintln!("conn-worker: failed to clone sockets (client: {c:?}, target: {t:?})");
@@ -246,6 +373,38 @@ mod unix {
         let mut client_reader = client;
         let mut target_reader = target;
 
+        let up_count = Arc::new(AtomicU64::new(0));
+        let down_count = Arc::new(AtomicU64::new(0));
+        let mut target_writer = CountingWriter {
+            inner: target_writer,
+            count: up_count.clone(),
+        };
+        let mut client_writer = CountingWriter {
+            inner: client_writer,
+            count: down_count.clone(),
+        };
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let reporter = stats_fd.map(|fd| {
+            // SAFETY: the parent passed this fd as an owned socket via
+            // `--stats-fd`; nothing else in this process uses it.
+            let mut socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            let (up, down) = (up_count.clone(), down_count.clone());
+            thread::spawn(move || {
+                use std::io::Write as _;
+                loop {
+                    let stopped = !matches!(
+                        stop_rx.recv_timeout(Duration::from_secs(1)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    );
+                    let report =
+                        encode_counts(up.load(Ordering::Relaxed), down.load(Ordering::Relaxed));
+                    if socket.write_all(&report).is_err() || stopped {
+                        break;
+                    }
+                }
+            })
+        });
+
         let shaping_for_c2t = shaping.clone();
         let client_to_target = thread::spawn(move || -> io::Result<u64> {
             let n = crate::shaping::shaped_copy_blocking(
@@ -254,7 +413,7 @@ mod unix {
                 crate::plugin::Direction::ClientToTarget,
                 shaping_for_c2t.as_ref(),
             )?;
-            target_writer.shutdown(Shutdown::Write).ok();
+            target_writer.inner.shutdown(Shutdown::Write).ok();
             Ok(n)
         });
         let target_to_client = thread::spawn(move || -> io::Result<u64> {
@@ -264,7 +423,7 @@ mod unix {
                 crate::plugin::Direction::TargetToClient,
                 shaping.as_ref(),
             )?;
-            client_writer.shutdown(Shutdown::Write).ok();
+            client_writer.inner.shutdown(Shutdown::Write).ok();
             Ok(n)
         });
 
@@ -284,6 +443,11 @@ mod unix {
                 ok = false;
             }
             Err(_) => ok = false,
+        }
+
+        drop(stop_tx);
+        if let Some(reporter) = reporter {
+            let _ = reporter.join();
         }
 
         if ok {

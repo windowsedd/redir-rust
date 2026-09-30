@@ -2,8 +2,11 @@
 //! for the unit, as-is, so you see exactly what you'd get running it
 //! directly, without an extra terminal or remembering the unit name.
 
-use std::process::{Command, ExitCode, Output};
+use std::process::ExitCode;
+#[cfg(not(windows))]
+use std::process::{Command, Output};
 
+#[cfg(not(windows))]
 pub fn run(unit: &str) -> ExitCode {
     match Command::new("systemctl")
         .args(["status", "--no-pager", "-l", unit])
@@ -24,6 +27,18 @@ pub fn run(unit: &str) -> ExitCode {
         }
         Err(err) => {
             eprintln!("error: failed to run systemctl: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn run(_unit: &str) -> ExitCode {
+    match crate::windows_process::status() {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(err) => {
+            eprintln!("error: {err}");
             ExitCode::FAILURE
         }
     }

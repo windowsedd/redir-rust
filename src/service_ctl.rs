@@ -3,8 +3,11 @@
 //! Inherits stdio, so `systemctl`'s own output (including permission errors)
 //! shows through as-is -- same root requirement `systemctl` always enforces.
 
-use std::process::{Command, ExitCode};
+#[cfg(not(windows))]
+use std::process::Command;
+use std::process::ExitCode;
 
+#[cfg(not(windows))]
 pub fn run(action: &str, unit: &str) -> ExitCode {
     match Command::new("systemctl").arg(action).arg(unit).status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
@@ -14,6 +17,26 @@ pub fn run(action: &str, unit: &str) -> ExitCode {
         }
         Err(err) => {
             eprintln!("failed to run systemctl: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn run(action: &str, _unit: &str) -> ExitCode {
+    let result = match action {
+        "start" => crate::windows_process::start(),
+        "stop" => crate::windows_process::stop(),
+        "restart" => crate::windows_process::stop().and_then(|_| crate::windows_process::start()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unknown action",
+        )),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
             ExitCode::FAILURE
         }
     }
