@@ -1,6 +1,6 @@
 [package]
 name = "redir-rust"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["windowsedd"]
 edition = "2021"
 description = "A Rust-based port redirector with plugin support, inspired by redir"
