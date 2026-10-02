@@ -114,6 +114,23 @@ jobs:
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
+      - name: Package Linux (.deb and .rpm)
+        if: endsWith(matrix.target, '-musl')
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          export REDIR_VERSION="${RELEASE_TAG#v}"
+          mkdir -p /tmp/nfpm
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz -o /tmp/nfpm/nfpm.tar.gz
+          curl -fsSL https://github.com/goreleaser/nfpm/releases/download/v2.47.0/checksums.txt -o /tmp/nfpm/checksums.txt
+          (cd /tmp/nfpm && grep ' nfpm_2.47.0_Linux_x86_64.tar.gz$' checksums.txt | sed 's/nfpm_2.47.0_Linux_x86_64.tar.gz/nfpm.tar.gz/' | sha256sum -c -)
+          tar -xzf /tmp/nfpm/nfpm.tar.gz -C /tmp/nfpm nfpm
+          sed 's|/usr/local/bin/redir-rust|/usr/bin/redir-rust|' packaging/systemd/redir-rust.service > dist/redir-rust.service
+          /tmp/nfpm/nfpm package --config packaging/linux/nfpm.yaml --packager deb --target "dist/redir-rust-${RELEASE_TAG}-amd64.deb"
+          /tmp/nfpm/nfpm package --config packaging/linux/nfpm.yaml --packager rpm --target "dist/redir-rust-${RELEASE_TAG}-x86_64.rpm"
+          (cd dist && for package in *.deb *.rpm; do sha256sum "$package" > "$package.sha256"; done)
+
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: bash
@@ -133,6 +150,8 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/*.sha256
           if-no-files-found: error
 
@@ -158,4 +177,30 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
             dist/*.sha256
+
+  winget:
+    name: Generate and submit WinGet manifests
+    needs: publish
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    uses: ./.github/workflows/winget.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    permissions:
+      contents: read
+
+  chocolatey:
+    name: Build and publish Chocolatey package
+    needs: publish
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    uses: ./.github/workflows/chocolatey.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+    permissions:
+      contents: read

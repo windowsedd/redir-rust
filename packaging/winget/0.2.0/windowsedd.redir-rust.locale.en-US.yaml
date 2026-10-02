@@ -1,0 +1,22 @@
+{
+  "PackageIdentifier": "windowsedd.redir-rust",
+  "PackageVersion": "0.2.0",
+  "PackageLocale": "en-US",
+  "Publisher": "windowsedd",
+  "PublisherUrl": "https://github.com/windowsedd",
+  "PackageName": "redir-rust",
+  "PackageUrl": "https://github.com/windowsedd/redir-rust",
+  "License": "MIT",
+  "LicenseUrl": "https://github.com/windowsedd/redir-rust/blob/v0.2.0/LICENSE",
+  "ShortDescription": "TCP/UDP port redirector with failover and Minecraft offline responses",
+  "Moniker": "redir-rust",
+  "Tags": [
+    "tcp",
+    "udp",
+    "proxy",
+    "minecraft"
+  ],
+  "ReleaseNotesUrl": "https://github.com/windowsedd/redir-rust/releases/tag/v0.2.0",
+  "ManifestType": "defaultLocale",
+  "ManifestVersion": "1.10.0"
+}

@@ -1,0 +1,31 @@
+name: redir-rust
+arch: amd64
+platform: linux
+version: ${REDIR_VERSION}
+maintainer: windowsedd <windowsedd@users.noreply.github.com>
+description: TCP/UDP port redirector with failover and Minecraft offline responses
+homepage: https://github.com/windowsedd/redir-rust
+license: MIT
+section: net
+priority: optional
+recommends:
+  - curl
+contents:
+  - src: target/x86_64-unknown-linux-musl/release/redir-rust
+    dst: /usr/bin/redir-rust
+  - src: dist/redir-rust.service
+    dst: /usr/lib/systemd/system/redir-rust.service
+  - src: packaging/linux/config.toml
+    dst: /etc/local/redir-rust/config.toml
+    type: config|noreplace
+  - src: settings.example.json
+    dst: /etc/local/redir-rust/settings.json
+    type: config|noreplace
+  - src: config.example.toml
+    dst: /usr/share/doc/redir-rust/config.example.toml
+  - src: LICENSE
+    dst: /usr/share/licenses/redir-rust/LICENSE
+scripts:
+  postinstall: packaging/linux/postinstall.sh
+  preremove: packaging/linux/preremove.sh
+  postremove: packaging/linux/postinstall.sh

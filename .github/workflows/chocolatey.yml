@@ -1,0 +1,83 @@
+name: Publish to Chocolatey
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    secrets:
+      CHOCOLATEY_API_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published stable release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chocolatey-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check package generator
+        run: python scripts/test-chocolatey-package.py
+      - name: Download release and prepare package
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'A stable vMAJOR.MINOR.PATCH tag is required' }
+          $release = gh release view $env:RELEASE_TAG --json isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read release' }
+          if ($release.isDraft -or $release.isPrerelease) { throw 'Release must be published and stable' }
+          $archive = "redir-rust-$env:RELEASE_TAG-x86_64-pc-windows-msvc.zip"
+          gh release download $env:RELEASE_TAG --pattern $archive --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download release ZIP' }
+          python scripts/chocolatey-package.py $env:RELEASE_TAG "dist/$archive"
+          if ($LASTEXITCODE -ne 0) { throw 'Package generation failed' }
+          $version = $env:RELEASE_TAG.Substring(1)
+          choco pack "dist/chocolatey/$version/redir-rust.nuspec" --output-directory dist
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey packing failed' }
+      - name: Test install, command shim, and uninstall
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          choco install redir-rust --version $version --source "$pwd/dist" --ignore-dependencies --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Package installation failed' }
+          $shim = Join-Path $env:ChocolateyInstall 'bin/redir-rust.exe'
+          $reported = & $shim --version
+          if ($LASTEXITCODE -ne 0 -or ($reported -join "`n") -notmatch "redir-rust $([regex]::Escape($version))\b") { throw 'Installed command version check failed' }
+          choco uninstall redir-rust --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Package uninstall failed' }
+          if (Test-Path $shim) { throw 'Command shim was not removed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chocolatey-${{ inputs.tag }}
+          path: dist/*.nupkg
+          if-no-files-found: error
+      - name: Push package to Chocolatey Community Repository
+        if: env.CHOCOLATEY_API_KEY != ''
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          choco push "dist/redir-rust.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
+          if ($LASTEXITCODE -ne 0) { throw 'Chocolatey publishing failed' }
+      - name: Report missing publishing key
+        if: env.CHOCOLATEY_API_KEY == ''
+        shell: pwsh
+        run: |
+          'Package built and tested. Add CHOCOLATEY_API_KEY to repository Actions secrets and rerun this workflow to upload it to Chocolatey.' >> $env:GITHUB_STEP_SUMMARY

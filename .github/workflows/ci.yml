@@ -28,6 +28,16 @@ jobs:
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check WinGet manifest generator
+        run: python scripts/test-winget-manifest.py
+
+      - name: Check Chocolatey package generator
+        run: python scripts/test-chocolatey-package.py
+
       - name: Build
         run: cargo build --all-targets --locked
 

@@ -1,0 +1,69 @@
+name: Publish to WinGet
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+    secrets:
+      WINGET_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published stable release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: winget-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check manifest generator
+        run: python scripts/test-winget-manifest.py
+      - name: Download published ZIP and generate manifests
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'A stable vMAJOR.MINOR.PATCH tag is required' }
+          $release = gh release view $env:RELEASE_TAG --json isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read release' }
+          if ($release.isDraft -or $release.isPrerelease) { throw 'Release must be published and stable' }
+          $archive = "redir-rust-$env:RELEASE_TAG-x86_64-pc-windows-msvc.zip"
+          gh release download $env:RELEASE_TAG --pattern $archive --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download release ZIP' }
+          python scripts/winget-manifest.py $env:RELEASE_TAG "dist/$archive"
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-${{ inputs.tag }}
+          path: dist/winget
+          if-no-files-found: error
+      - name: Submit manifests to microsoft/winget-pkgs
+        if: env.WINGET_CREATE_GITHUB_TOKEN != ''
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          $version = $env:RELEASE_TAG.Substring(1)
+          .\wingetcreate.exe submit "dist/winget/$version" --no-open
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet submission failed' }
+      - name: Report missing submission token
+        if: env.WINGET_CREATE_GITHUB_TOKEN == ''
+        shell: pwsh
+        run: |
+          'Manifests generated. Add the WINGET_TOKEN repository secret and rerun this workflow to submit them to microsoft/winget-pkgs.' >> $env:GITHUB_STEP_SUMMARY
