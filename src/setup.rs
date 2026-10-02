@@ -73,7 +73,44 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
 
     section(output, 2, "Listen address")?;
     message(output, "Accept client connections on this machine:")?;
-    let listen = socket(input, output, "Listen IP address", "Listen port", true)?;
+    let listen = loop {
+        let addr = socket(input, output, "Listen IP address", "Listen port", true)?;
+        let available = match protocol {
+            Protocol::Tcp => std::net::TcpListener::bind(addr).map(drop),
+            Protocol::Udp => std::net::UdpSocket::bind(addr).map(drop),
+        };
+        match available {
+            Ok(()) => break addr,
+            Err(err) => {
+                let protocol_name = if protocol == Protocol::Tcp {
+                    "TCP"
+                } else {
+                    "UDP"
+                };
+                let reason = if err.kind() == io::ErrorKind::AddrInUse {
+                    "already in use".to_string()
+                } else {
+                    err.to_string()
+                };
+                let error = format!("Cannot listen on {protocol_name} {addr}: {reason}");
+                if interactive() {
+                    if crate::prompts::select(&error)?
+                        .item("retry", "Choose another listen address or port", "")
+                        .item("back", "⬅ Previous", "Return without saving")
+                        .interact()?
+                        == "back"
+                    {
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "previous").into());
+                    }
+                } else {
+                    message(
+                        output,
+                        &format!("{error}. Choose another listen address or port."),
+                    )?;
+                }
+            }
+        }
+    };
     section(output, 3, "Backend targets")?;
     message(output, "Targets are tried in the order shown below.")?;
     let mut targets = Vec::new();
@@ -976,6 +1013,50 @@ mod tests {
     }
 
     #[test]
+    fn setup_reports_occupied_tcp_and_udp_ports_without_saving() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for (protocol, addr) in [
+            ("tcp", tcp.local_addr().unwrap()),
+            ("udp", udp.local_addr().unwrap()),
+        ] {
+            let path = test_path();
+            let answers = format!("relay\n{protocol}\n127.0.0.1\n{}\n", addr.port());
+            let mut output = Vec::new();
+            assert!(run_with(&mut Cursor::new(answers), &mut output, &path).is_err());
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("already in use"), "{text}");
+            assert!(text.contains(&addr.to_string()), "{text}");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn setup_retries_occupied_tcp_port_and_allows_same_port_for_udp() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let available_port = available.local_addr().unwrap().port();
+        drop(available);
+        for (protocol, listen_answers, expected_port) in [
+            (
+                "tcp",
+                format!("127.0.0.1\n{occupied_port}\n127.0.0.1\n{available_port}"),
+                available_port,
+            ),
+            ("udp", format!("127.0.0.1\n{occupied_port}"), occupied_port),
+        ] {
+            let path = test_path();
+            let answers =
+                format!("relay\n{protocol}\n{listen_answers}\n127.0.0.1\n25566\nn\n\n\ny\n");
+            run_with(&mut Cursor::new(answers), &mut Vec::new(), &path).unwrap();
+            let config = FileConfig::parse_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(config.redirects[0].listen.port(), expected_port);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn tailscale_picker_selects_address_and_allows_manual_return() {
         let devices = vec![crate::tailscale::DeviceAddress {
             label: "backend — fd7a:115c:a1e0::2 (online)".into(),
@@ -1108,14 +1189,17 @@ mod tests {
     #[test]
     fn saves_ordered_bedrock_targets_and_selected_plugin() {
         let path = test_path();
-        let answers = "bedrock-relay\nudp\n0.0.0.0\n19132\n10.0.0.20\n19133\ny\n10.0.0.21\n19133\nn\n\n1\n\nOffline\nTry later\ny\n";
+        let listener = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let answers = format!("bedrock-relay\nudp\n0.0.0.0\n{port}\n10.0.0.20\n19133\ny\n10.0.0.21\n19133\nn\n\n1\n\nOffline\nTry later\ny\n");
         let mut output = Vec::new();
         run_with(&mut Cursor::new(answers), &mut output, &path).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         let config = FileConfig::parse_str(&saved).unwrap();
         let redirect = &config.redirects[0];
         assert_eq!(redirect.name.as_deref(), Some("bedrock-relay"));
-        assert_eq!(redirect.listen.to_string(), "0.0.0.0:19132");
+        assert_eq!(redirect.listen.to_string(), format!("0.0.0.0:{port}"));
         assert_eq!(
             redirect
                 .target_config
@@ -1144,9 +1228,13 @@ mod tests {
     #[test]
     fn duplicate_name_is_reprompted_before_other_questions() {
         let path = test_path();
-        let answers = "relay\ntcp\n127.0.0.1\n25565\n127.0.0.1\n25566\nn\n\n\ny\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let answers = format!("relay\ntcp\n127.0.0.1\n{port}\n127.0.0.1\n25566\nn\n\n\ny\n");
         run_with(&mut Cursor::new(answers), &mut Vec::new(), &path).unwrap();
-        let answers = "relay\nrelay-two\ntcp\n127.0.0.1\n25567\n127.0.0.1\n25568\nn\n\n\ny\n";
+        let answers =
+            format!("relay\nrelay-two\ntcp\n127.0.0.1\n{port}\n127.0.0.1\n25568\nn\n\n\ny\n");
         let mut output = Vec::new();
         run_with(&mut Cursor::new(answers), &mut output, &path).unwrap();
         assert!(String::from_utf8(output)

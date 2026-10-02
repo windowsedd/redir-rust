@@ -16,7 +16,10 @@ when the command exits. It can add and remove redirects,
 edit validated TOML, and control the service. Setup Config guides you through a
 named TCP or UDP redirect: public listen address and port, one or more backend
 addresses and ports in failover order, timeout, and an optional offline MOTD
-plugin checkbox. Review the settings before saving. On Linux Start and Stop
+plugin checkbox. Setup checks the chosen listen address with a temporary TCP or
+UDP bind and asks for another address if it is occupied or cannot be bound.
+The check releases the socket immediately; startup checks availability again.
+Review the settings before saving. On Linux Start and Stop
 control the systemd service. On Windows they control a background process using
 the config selected by `settings.json`; its PID stays in `%APPDATA%\redir-rust`
 and its log is stored beside the selected config.
