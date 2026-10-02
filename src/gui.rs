@@ -299,25 +299,28 @@ fn action(route: &str, path: &Path, input: &Value) -> Result<String> {
                     bufsize_bytes: 16 * 1024,
                 },
             )?;
-            Ok(format!("Saved {name}. Restart to apply changes."))
+            Ok(format!("Saved {name}. Reload to apply changes."))
         }
         "/api/remove" => {
             let name = field(input, "name")?;
             config_manager::remove(path, name)?;
-            Ok(format!("Removed {name}. Restart to apply changes."))
+            Ok(format!("Removed {name}. Reload to apply changes."))
         }
         "/api/save" => {
             config_manager::save_text(path, field(input, "text")?)?;
-            Ok("Config saved. Restart to apply changes.".into())
+            Ok("Config saved. Reload to apply changes.".into())
         }
         "/api/service" => {
             let choice = field(input, "action")?;
-            if !["start", "stop", "restart"].contains(&choice) {
+            if !["start", "stop", "restart", "reload"].contains(&choice) {
                 return Err("Invalid service action".into());
             }
-            let output = Command::new(std::env::current_exe()?)
-                .arg(format!("--{choice}"))
-                .output()?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command.arg(format!("--{choice}"));
+            if choice == "reload" {
+                command.arg("--config").arg(path);
+            }
+            let output = command.output()?;
             let message = format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),

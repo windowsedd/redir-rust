@@ -546,3 +546,107 @@ async fn empty_target_list_is_rejected_before_binding() {
     .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+#[tokio::test]
+async fn reload_and_retirement_preserve_pending_target_selection() {
+    use tokio::sync::{oneshot, watch};
+    let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let primary = backend.local_addr().unwrap();
+    let (observed_tx, observed_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut buf = [0; 2048];
+        let (n, probe_client) = backend.recv_from(&mut buf).await.unwrap();
+        let pong = bedrock_offline::build_unconnected_pong(
+            &buf[..n],
+            &BedrockOfflineConfig::new("old".into(), "".into()),
+            primary.port(),
+        )
+        .unwrap();
+        observed_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        backend.send_to(&pong, probe_client).await.unwrap();
+        let (n, client) = backend.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pending");
+        backend.send_to(b"original", client).await.unwrap();
+    });
+    let replacement = spawn_echo_backend().await;
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = UdpProxyConfig {
+        name: "pending-reload".into(),
+        listen_addr: addr,
+        targets: vec![primary, replacement],
+        idle_timeout: Duration::from_secs(5),
+        probe_timeout: Duration::from_secs(2),
+        bedrock_offline: None,
+    };
+    let (tx, rx) = watch::channel(Some(config.clone()));
+    let proxy = TestProxy {
+        listen_addr: addr,
+        task: tokio::spawn(udp_proxy::run_reconfigurable(listener, rx)),
+    };
+    let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    old.send_to(b"pending", proxy.addr()).await.unwrap();
+    timeout(Duration::from_secs(2), observed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    config.targets = vec![replacement];
+    tx.send_replace(Some(config));
+    let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    new.send_to(b"new", proxy.addr()).await.unwrap();
+    assert_eq!(recv(&new).await, b"new");
+    tx.send_replace(None);
+    release_tx.send(()).unwrap();
+    assert_eq!(recv(&old).await, b"original");
+}
+
+#[tokio::test]
+async fn reload_keeps_original_offline_handshake_settings() {
+    use tokio::sync::watch;
+    let silent =
+        spawn_bedrock_backend(b"unused", Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = UdpProxyConfig {
+        name: "offline-reload".into(),
+        listen_addr: addr,
+        targets: vec![silent, silent],
+        idle_timeout: Duration::from_secs(5),
+        probe_timeout: TEST_PROBE_TIMEOUT,
+        bedrock_offline: Some(BedrockOfflineConfig {
+            motd_line1: "Original maintenance".into(),
+            motd_line2: "".into(),
+            server_guid: 42,
+        }),
+    };
+    let (tx, rx) = watch::channel(Some(config.clone()));
+    let proxy = TestProxy {
+        listen_addr: addr,
+        task: tokio::spawn(udp_proxy::run_reconfigurable(listener, rx)),
+    };
+    let old = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut request = vec![0x05];
+    request.extend_from_slice(&RAKNET_MAGIC);
+    request.push(11);
+    request.resize(64, 0);
+    old.send_to(&request, proxy.addr()).await.unwrap();
+    assert_eq!(recv(&old).await[0], 0x06);
+    config.bedrock_offline = None;
+    config.targets = vec![spawn_echo_backend().await];
+    tx.send_replace(Some(config));
+    let new = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    new.send_to(b"new", proxy.addr()).await.unwrap();
+    assert_eq!(recv(&new).await, b"new");
+    old.send_to(&unconnected_ping(), proxy.addr())
+        .await
+        .unwrap();
+    let pong = recv(&old).await;
+    assert!(String::from_utf8_lossy(&pong[35..]).contains("Original maintenance"));
+    tx.send_replace(None);
+    old.send_to(&unconnected_ping(), proxy.addr())
+        .await
+        .unwrap();
+    assert_eq!(recv(&old).await[0], 0x1c);
+}

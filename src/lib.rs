@@ -15,6 +15,8 @@ pub mod plugin;
 pub mod plugins;
 pub mod proctitle;
 pub mod proxy;
+pub mod reload;
+pub mod runtime;
 pub mod service_ctl;
 pub mod shaping;
 pub mod status;

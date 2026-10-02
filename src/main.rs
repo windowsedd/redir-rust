@@ -1,17 +1,11 @@
 #[allow(unused_variables, dead_code)]
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
 
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser};
 
 use redir_rust::config::{self, FileConfig, Protocol, RedirectConfig};
-use redir_rust::plugin::Plugin;
-use redir_rust::plugins::MinecraftOfflinePlugin;
-use redir_rust::proxy::{self, ProxyConfig};
-use redir_rust::udp_proxy::{self, UdpProxyConfig};
-use redir_rust::{config_manager, conn_worker, edit_config, install, notify, service_ctl, status};
+use redir_rust::{config_manager, conn_worker, edit_config, install, service_ctl, status};
 
 mod gui;
 mod menu;
@@ -79,6 +73,11 @@ struct Cli {
     #[arg(long = "restart")]
     service_restart: bool,
 
+    /// Reload the running instance's config while preserving established sessions.
+    /// Uses --config or the path from settings.json.
+    #[arg(long = "reload", conflicts_with_all = ["add", "remove", "edit", "edit_config", "service_start", "service_stop", "service_restart", "gui", "install_systemd", "update"])]
+    reload: bool,
+
     /// Unit name used by --service-status/--start/--stop/--restart.
     #[arg(long = "unit", default_value = "redir-rust.service")]
     unit: String,
@@ -111,12 +110,12 @@ struct Cli {
     name: Option<String>,
 
     /// Local address to listen on, e.g. 0.0.0.0:25565
-    #[arg(short = 'l', long = "listen", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "edit_config", "remove", "edit"])]
+    #[arg(short = 'l', long = "listen", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "reload", "edit_config", "remove", "edit"])]
     listen: Option<SocketAddr>,
 
     /// Backend target address to forward connections to, in priority order.
     /// Repeat for additional targets, e.g. `-t 127.0.0.1:25566 -t 127.0.0.1:25567`.
-    #[arg(short = 't', long = "target", value_name = "TARGET", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "edit_config", "remove", "edit"])]
+    #[arg(short = 't', long = "target", value_name = "TARGET", required_unless_present_any = ["gui", "config", "settings", "install_systemd", "update", "service_status", "monitor", "service_start", "service_stop", "service_restart", "reload", "edit_config", "remove", "edit"])]
     targets: Vec<SocketAddr>,
 
     /// Transport to relay: "tcp" (default) or "udp".
@@ -281,6 +280,7 @@ async fn real_main() -> ExitCode {
         Some(path) => path.clone(),
         None if cli.settings.is_some()
             || cli.gui
+            || cli.reload
             || cli.edit_config
             || cli.add
             || cli.remove.is_some()
@@ -304,6 +304,19 @@ async fn real_main() -> ExitCode {
         None => config_manager::default_path(),
     };
 
+    if cli.reload {
+        return match redir_rust::reload::request(&config_path) {
+            Ok(()) => {
+                println!("Configuration reloaded; established connections and sessions retained.");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: reload failed: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if cli.gui {
         return gui::run(
             &config_path,
@@ -326,7 +339,7 @@ async fn real_main() -> ExitCode {
         let name = cli.name.as_deref().unwrap();
         return match config_manager::add(&config_path, cli_redirect(&cli)) {
             Ok(()) => {
-                println!("added redirect {name:?}; restart redir-rust to apply it");
+                println!("added redirect {name:?}; reload redir-rust to apply it");
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -339,9 +352,9 @@ async fn real_main() -> ExitCode {
         return match config_manager::remove(&config_path, name) {
             Ok(last_redirect) => {
                 if last_redirect {
-                    println!("removed redirect {name:?}; no redirects remain, so stop redir-rust");
+                    println!("removed redirect {name:?}; no redirects remain; reload redir-rust to drain its listeners");
                 } else {
-                    println!("removed redirect {name:?}; restart redir-rust to apply it");
+                    println!("removed redirect {name:?}; reload redir-rust to apply it");
                 }
                 ExitCode::SUCCESS
             }
@@ -354,7 +367,7 @@ async fn real_main() -> ExitCode {
     if let Some(name) = &cli.edit {
         return match config_manager::edit(&config_path, name) {
             Ok(()) => {
-                println!("edited redirect {name:?}; restart redir-rust to apply it");
+                println!("edited redirect {name:?}; reload redir-rust to apply it");
                 ExitCode::SUCCESS
             }
             Err(err) => {
@@ -375,35 +388,14 @@ async fn real_main() -> ExitCode {
         None => vec![cli_redirect(&cli)],
     };
 
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut startup = Vec::new();
-    for redirect in redirects {
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        startup.push(ready_rx);
-        tasks.spawn(run_redirect(redirect, ready_tx));
-    }
-    for ready in startup {
-        if ready.await.is_err() {
-            let _ = wait_for_tasks(&mut tasks).await;
-            return ExitCode::FAILURE;
+    let reload_path =
+        (cli.config.is_some() || cli.settings.is_some()).then_some(config_path.as_path());
+    match redir_rust::runtime::run(redirects, reload_path).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(%err, "redirect exited with error");
+            ExitCode::FAILURE
         }
-    }
-
-    notify::ready();
-    redir_rust::connections::spawn_snapshot_task();
-
-    let failed = tokio::select! {
-        failed = wait_for_tasks(&mut tasks) => failed,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, shutting down");
-            false
-        }
-    };
-
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
     }
 }
 
@@ -438,148 +430,10 @@ fn cli_redirect(cli: &Cli) -> RedirectConfig {
     }
 }
 
-async fn wait_for_tasks(tasks: &mut tokio::task::JoinSet<std::io::Result<()>>) -> bool {
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::error!(%err, "redirect exited with error");
-                return true;
-            }
-            Err(join_err) => {
-                tracing::error!(%join_err, "redirect task panicked");
-                return true;
-            }
-        }
-    }
-    false
-}
-
-async fn run_redirect(
-    redirect: RedirectConfig,
-    ready: tokio::sync::oneshot::Sender<()>,
-) -> std::io::Result<()> {
-    let protocol = match redirect.protocol {
-        Protocol::Tcp => "tcp",
-        Protocol::Udp => "udp",
-    };
-    redir_rust::connections::register_redirect(&redirect.display_name(), protocol, redirect.listen);
-    match redirect.protocol {
-        Protocol::Tcp => run_tcp_redirect(redirect, ready).await,
-        Protocol::Udp => run_udp_redirect(redirect, ready).await,
-    }
-}
-
-async fn run_udp_redirect(
-    redirect: RedirectConfig,
-    ready: tokio::sync::oneshot::Sender<()>,
-) -> std::io::Result<()> {
-    if redirect.minecraft_plugins().is_some() {
-        tracing::warn!(
-            name = %redirect.display_name(),
-            "minecraft plugins apply to TCP redirects only; ignoring for this UDP redirect"
-        );
-    }
-
-    let bedrock_offline = match redirect.bedrock_plugins() {
-        Some(bp) if bp.enabled => Some(
-            redir_rust::plugins::bedrock_offline::BedrockOfflineConfig::new(
-                bp.motd_line1
-                    .clone()
-                    .unwrap_or_else(redir_rust::plugins::bedrock_offline::default_motd_line1),
-                bp.motd_line2
-                    .clone()
-                    .unwrap_or_else(redir_rust::plugins::bedrock_offline::default_motd_line2),
-            ),
-        ),
-        _ => None,
-    };
-
-    let config = UdpProxyConfig {
-        name: redirect.display_name(),
-        listen_addr: redirect.listen,
-        targets: redirect.target_addrs().to_vec(),
-        idle_timeout: redirect.udp_idle_timeout(),
-        probe_timeout: Duration::from_secs(2),
-        bedrock_offline,
-    };
-
-    let socket = tokio::net::UdpSocket::bind(config.listen_addr).await?;
-    let _ = ready.send(());
-    udp_proxy::run_with_socket(config, socket).await
-}
-
-async fn run_tcp_redirect(
-    redirect: RedirectConfig,
-    ready: tokio::sync::oneshot::Sender<()>,
-) -> std::io::Result<()> {
-    if redirect.bedrock_plugins().is_some() {
-        tracing::warn!(
-            name = %redirect.display_name(),
-            "bedrock offline motd applies to UDP redirects only; ignoring for this TCP redirect"
-        );
-    }
-
-    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-    if let Some(mc) = redirect.minecraft_plugins() {
-        if mc.enabled {
-            let mut plugin = MinecraftOfflinePlugin::new(redirect.listen.port());
-
-            if let Some(status_line) = &mc.status_line {
-                plugin = plugin.with_status_line(status_line.clone());
-            }
-            if mc.motd_line1.is_some() || mc.motd_line2.is_some() {
-                plugin = plugin.with_motd(
-                    mc.motd_line1
-                        .clone()
-                        .unwrap_or_else(redir_rust::plugins::minecraft_offline::default_motd_line1),
-                    mc.motd_line2
-                        .clone()
-                        .unwrap_or_else(redir_rust::plugins::minecraft_offline::default_motd_line2),
-                );
-            }
-            if let Some(favicon_path) = &mc.favicon_path {
-                let bytes = std::fs::read(favicon_path).map_err(|err| {
-                    std::io::Error::new(
-                        err.kind(),
-                        format!("failed to read favicon {}: {err}", favicon_path.display()),
-                    )
-                })?;
-                plugin = plugin.with_favicon_png_bytes(Some(&bytes));
-            }
-
-            plugins.push(Arc::new(plugin));
-        }
-    }
-
-    let config = ProxyConfig::new(
-        redirect.display_name(),
-        redirect.listen,
-        redirect.target_addrs().to_vec(),
-        redirect.connect_timeout(),
-        redirect.shaping(),
-    );
-
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    let _ = ready.send(());
-    proxy::run_with_listener(config, listener, plugins).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
-
-    #[tokio::test]
-    async fn a_failed_redirect_stops_other_redirects() {
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async { Err(std::io::Error::other("bind failed")) });
-        tasks.spawn(async { std::future::pending::<std::io::Result<()>>().await });
-        let failed = tokio::time::timeout(Duration::from_millis(100), wait_for_tasks(&mut tasks))
-            .await
-            .expect("a failed listener must stop the service");
-        assert!(failed);
-    }
 
     #[test]
     fn accepts_repeated_targets_in_order() {

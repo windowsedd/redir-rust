@@ -273,9 +273,9 @@ fn run_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) ->
         },
     )?;
     if interactive() {
-        cliclack::outro("Saved. Restart redir-rust to apply the new config.")?;
+        cliclack::outro("Saved. Reload redir-rust to apply the new config.")?;
     } else {
-        writeln!(output, "Saved. Restart redir-rust to apply the new config.")?;
+        writeln!(output, "Saved. Reload redir-rust to apply the new config.")?;
     }
     Ok(())
 }
@@ -386,7 +386,7 @@ fn edit_with<R: BufRead, W: Write>(input: &mut R, output: &mut W, path: &Path) -
                 } else {
                     redir_rust::edit_config::run(path);
                 }
-                writeln!(output, "Restart redir-rust to apply saved changes.")?;
+                writeln!(output, "Reload redir-rust to apply saved changes.")?;
                 break;
             }
             match edit_field(input, output, path, index, field, redirect) {
@@ -642,7 +642,7 @@ fn edit_field<R: BufRead, W: Write>(
     )?;
     if save == "y" {
         config_manager::update(path, index, redirect)?;
-        writeln!(output, "✅ Saved. Restart redir-rust to apply changes.")?;
+        writeln!(output, "✅ Saved. Reload redir-rust to apply changes.")?;
     } else {
         writeln!(output, "Cancelled; config unchanged.")?;
     }

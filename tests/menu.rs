@@ -8,7 +8,7 @@ fn bare_invocation_offers_menu_and_exit() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"8\n").unwrap();
+    child.stdin.take().unwrap().write_all(b"9\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let menu = String::from_utf8(output.stdout).unwrap();
@@ -22,6 +22,7 @@ fn bare_invocation_offers_menu_and_exit() {
         "Status",
         "Monitor",
         "Open GUI",
+        "Reload",
         "Exit",
     ] {
         assert!(menu.contains(item), "missing {item} from menu: {menu}");
@@ -48,7 +49,7 @@ fn menu_shows_service_state_without_systemctl_diagnostics() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"8\n").unwrap();
+    child.stdin.take().unwrap().write_all(b"9\n").unwrap();
     let output = child.wait_with_output().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let menu = String::from_utf8(output.stdout).unwrap();

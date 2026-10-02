@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -46,6 +46,11 @@ struct Session {
 }
 
 type Sessions = Arc<Mutex<HashMap<SocketAddr, Session>>>;
+
+struct OfflineSession {
+    session: FakeSession,
+    config: BedrockOfflineConfig,
+}
 
 struct PendingSelection {
     generation: u64,
@@ -133,6 +138,7 @@ struct SelectionResult {
     client_addr: SocketAddr,
     generation: u64,
     target_addr: Option<SocketAddr>,
+    config: UdpProxyConfig,
 }
 
 /// Runs a UDP relay. Single-target redirects retain generic UDP behavior and
@@ -150,7 +156,8 @@ pub async fn run(config: UdpProxyConfig) -> io::Result<()> {
 pub async fn run_with_socket(mut config: UdpProxyConfig, listener: UdpSocket) -> io::Result<()> {
     validate_config(&config)?;
     config.listen_addr = listener.local_addr()?;
-    run_loop(config, Arc::new(listener)).await
+    let (_keep_alive, updates) = watch::channel(Some(config));
+    run_reconfigurable(listener, updates).await
 }
 
 fn validate_config(config: &UdpProxyConfig) -> io::Result<()> {
@@ -163,63 +170,110 @@ fn validate_config(config: &UdpProxyConfig) -> io::Result<()> {
     Ok(())
 }
 
-async fn run_loop(config: UdpProxyConfig, listener: Arc<UdpSocket>) -> io::Result<()> {
+/// Updates affect new sessions; None drains existing sessions and releases
+/// the listener after their original idle timeouts expire.
+pub async fn run_reconfigurable(
+    listener: UdpSocket,
+    mut updates: watch::Receiver<Option<UdpProxyConfig>>,
+) -> io::Result<()> {
+    let Some(mut config) = updates.borrow_and_update().clone() else {
+        return Ok(());
+    };
+    validate_config(&config)?;
+    config.listen_addr = listener.local_addr()?;
+    let listener = Arc::new(listener);
+    let mut draining = false;
+    let mut watch_open = true;
+    let mut maintenance = tokio::time::interval(Duration::from_millis(100));
+    // JoinSet aborts reachability probes on update, retirement, or loop exit.
+    let mut probers = tokio::task::JoinSet::new();
     info!(name = %config.name, listen = %config.listen_addr, targets = ?config.targets, "listening (udp)");
 
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let mut fake_sessions: HashMap<SocketAddr, FakeSession> = HashMap::new();
+    let mut fake_sessions: HashMap<SocketAddr, OfflineSession> = HashMap::new();
     let mut pending = PendingState::new(MAX_PENDING_CLIENTS, MAX_PENDING_BYTES);
     let mut global_pending_limit_logged = false;
     let mut next_generation = 0u64;
     let (selection_tx, mut selection_rx) = mpsc::unbounded_channel::<SelectionResult>();
 
-    let target_reachable = (config.targets.len() == 1)
-        .then(|| {
-            config
-                .bedrock_offline
-                .as_ref()
-                .map(|_| spawn_reachability_prober(config.targets[0], config.probe_timeout))
-        })
-        .flatten();
+    let mut target_reachable = reachability_for(&config, &mut probers);
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         tokio::select! {
+            biased;
+            changed = updates.changed(), if watch_open => {
+                watch_open = changed.is_ok();
+                let next = updates.borrow_and_update().clone();
+                probers.abort_all();
+                target_reachable = None;
+                match next {
+                    Some(mut next) if watch_open => {
+                        validate_config(&next)?;
+                        next.listen_addr = listener.local_addr()?;
+                        config = next;
+                        target_reachable = reachability_for(&config, &mut probers);
+                    }
+                    _ => draining = true,
+                }
+            }
+            _ = maintenance.tick() => {
+                fake_sessions.retain(|_, session| session.session.last_activity.elapsed() < FAKE_SESSION_IDLE_TIMEOUT);
+                if draining && sessions.lock().await.is_empty()
+                    && pending.selections.is_empty() && fake_sessions.is_empty() {
+                    return Ok(());
+                }
+                while probers.try_join_next().is_some() {}
+            }
+            Some(result) = selection_rx.recv() => {
+                let is_current = pending.is_current(&result.client_addr, result.generation);
+                if !is_current {
+                    debug!(client = %result.client_addr, generation = result.generation, "ignoring stale udp target selection");
+                    continue;
+                }
+                let selection = pending.remove(result.client_addr).unwrap();
+                let selected_config = result.config;
+                let queued = selection.datagrams;
+                global_pending_limit_logged = false;
+
+                if let Some(target_addr) = result.target_addr {
+                    match create_session(&sessions, &listener, &selected_config, result.client_addr, target_addr).await {
+                        Ok((socket, traffic)) => {
+                            debug!(client = %result.client_addr, target = %target_addr, "udp target selected");
+                            flush_queued_datagrams(
+                                &socket,
+                                &traffic,
+                                queued,
+                                result.client_addr,
+                                target_addr,
+                            )
+                            .await;
+                        }
+                        Err(err) => warn!(client = %result.client_addr, target = %target_addr, %err, "failed to open selected udp session"),
+                    }
+                } else {
+                    debug!(client = %result.client_addr, "all udp targets unreachable");
+                    if selected_config.bedrock_offline.is_some() {
+                        for datagram in queued {
+                            handle_offline_datagram(&listener, &selected_config, &mut fake_sessions, result.client_addr, &datagram).await;
+                        }
+                    }
+                }
+            }
             received = listener.recv_from(&mut buf) => {
                 let (n, client_addr) = received?;
                 let datagram = &buf[..n];
 
-                fake_sessions.retain(|_, session| session.last_activity.elapsed() < FAKE_SESSION_IDLE_TIMEOUT);
+                fake_sessions.retain(|_, session| session.session.last_activity.elapsed() < FAKE_SESSION_IDLE_TIMEOUT);
                 if fake_sessions.contains_key(&client_addr) {
                     handle_offline_datagram(&listener, &config, &mut fake_sessions, client_addr, datagram).await;
                     continue;
-                }
-
-                if let Some(reachable) = &target_reachable {
-                    if reachable.load(Ordering::Relaxed) == REACHABILITY_DOWN
-                        && handle_offline_datagram(&listener, &config, &mut fake_sessions, client_addr, datagram).await
-                    {
-                        continue;
-                    }
                 }
 
                 if let Some((socket, traffic)) = existing_session(&sessions, client_addr).await {
                     match socket.send(datagram).await {
                         Ok(n) => traffic.add_up(n as u64),
                         Err(err) => warn!(client = %client_addr, %err, "failed to forward udp datagram to target"),
-                    }
-                    continue;
-                }
-
-                if config.targets.len() == 1 {
-                    match create_session(&sessions, &listener, &config, client_addr, config.targets[0]).await {
-                        Ok((socket, traffic)) => {
-                            match socket.send(datagram).await {
-                                Ok(n) => traffic.add_up(n as u64),
-                                Err(err) => warn!(client = %client_addr, %err, "failed to forward udp datagram to target"),
-                            }
-                        }
-                        Err(err) => warn!(client = %client_addr, %err, "failed to open udp session"),
                     }
                     continue;
                 }
@@ -240,6 +294,31 @@ async fn run_loop(config: UdpProxyConfig, listener: Arc<UdpSocket>) -> io::Resul
                     continue;
                 }
 
+                if draining {
+                    continue;
+                }
+
+                if let Some(reachable) = &target_reachable {
+                    if reachable.load(Ordering::Relaxed) == REACHABILITY_DOWN
+                        && handle_offline_datagram(&listener, &config, &mut fake_sessions, client_addr, datagram).await
+                    {
+                        continue;
+                    }
+                }
+
+                if config.targets.len() == 1 {
+                    match create_session(&sessions, &listener, &config, client_addr, config.targets[0]).await {
+                        Ok((socket, traffic)) => {
+                            match socket.send(datagram).await {
+                                Ok(n) => traffic.add_up(n as u64),
+                                Err(err) => warn!(client = %client_addr, %err, "failed to forward udp datagram to target"),
+                            }
+                        }
+                        Err(err) => warn!(client = %client_addr, %err, "failed to open udp session"),
+                    }
+                    continue;
+                }
+
                 next_generation = next_generation.wrapping_add(1);
                 let generation = next_generation;
                 if !pending.start(client_addr, generation, datagram.to_vec()) {
@@ -254,43 +333,10 @@ async fn run_loop(config: UdpProxyConfig, listener: Arc<UdpSocket>) -> io::Resul
                     selection_tx.clone(),
                     client_addr,
                     generation,
-                    config.targets.clone(),
-                    config.probe_timeout,
+                    config.clone(),
                 );
             }
-            Some(result) = selection_rx.recv() => {
-                let is_current = pending.is_current(&result.client_addr, result.generation);
-                if !is_current {
-                    debug!(client = %result.client_addr, generation = result.generation, "ignoring stale udp target selection");
-                    continue;
-                }
-                let queued = pending.remove(result.client_addr).unwrap().datagrams;
-                global_pending_limit_logged = false;
 
-                if let Some(target_addr) = result.target_addr {
-                    match create_session(&sessions, &listener, &config, result.client_addr, target_addr).await {
-                        Ok((socket, traffic)) => {
-                            debug!(client = %result.client_addr, target = %target_addr, "udp target selected");
-                            flush_queued_datagrams(
-                                &socket,
-                                &traffic,
-                                queued,
-                                result.client_addr,
-                                target_addr,
-                            )
-                            .await;
-                        }
-                        Err(err) => warn!(client = %result.client_addr, target = %target_addr, %err, "failed to open selected udp session"),
-                    }
-                } else {
-                    debug!(client = %result.client_addr, "all udp targets unreachable");
-                    if config.bedrock_offline.is_some() {
-                        for datagram in queued {
-                            handle_offline_datagram(&listener, &config, &mut fake_sessions, result.client_addr, &datagram).await;
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -299,13 +345,12 @@ fn spawn_target_selection(
     tx: mpsc::UnboundedSender<SelectionResult>,
     client_addr: SocketAddr,
     generation: u64,
-    targets: Vec<SocketAddr>,
-    probe_timeout: Duration,
+    config: UdpProxyConfig,
 ) {
     tokio::spawn(async move {
         let mut selected = None;
-        for target_addr in targets {
-            if bedrock_offline::probe_target(target_addr, probe_timeout).await {
+        for &target_addr in &config.targets {
+            if bedrock_offline::probe_target(target_addr, config.probe_timeout).await {
                 selected = Some(target_addr);
                 break;
             }
@@ -315,6 +360,7 @@ fn spawn_target_selection(
             client_addr,
             generation,
             target_addr: selected,
+            config,
         });
     });
 }
@@ -339,17 +385,21 @@ async fn flush_queued_datagrams(
 async fn handle_offline_datagram(
     listener: &Arc<UdpSocket>,
     config: &UdpProxyConfig,
-    fake_sessions: &mut HashMap<SocketAddr, FakeSession>,
+    fake_sessions: &mut HashMap<SocketAddr, OfflineSession>,
     client_addr: SocketAddr,
     datagram: &[u8],
 ) -> bool {
-    let Some(offline) = &config.bedrock_offline else {
+    let Some(offline) = fake_sessions
+        .get(&client_addr)
+        .map(|s| s.config.clone())
+        .or_else(|| config.bedrock_offline.clone())
+    else {
         return false;
     };
 
     if bedrock_offline::is_unconnected_ping(datagram) {
         if let Some(pong) =
-            bedrock_offline::build_unconnected_pong(datagram, offline, config.listen_addr.port())
+            bedrock_offline::build_unconnected_pong(datagram, &offline, config.listen_addr.port())
         {
             if let Err(err) = listener.send_to(&pong, client_addr).await {
                 warn!(client = %client_addr, %err, "failed to send bedrock offline pong");
@@ -369,16 +419,19 @@ async fn handle_offline_datagram(
     }
     let session = fake_sessions
         .entry(client_addr)
-        .or_insert_with(bedrock_offline::new_session);
+        .or_insert_with(|| OfflineSession {
+            session: bedrock_offline::new_session(),
+            config: offline.clone(),
+        });
     let replies = bedrock_offline::handle_datagram(
-        session,
+        &mut session.session,
         datagram,
         client_addr,
         offline.server_guid,
         &offline.motd_line1,
         &offline.motd_line2,
     );
-    let done = session.is_done();
+    let done = session.session.is_done();
     for reply in replies {
         if let Err(err) = listener.send_to(&reply, client_addr).await {
             warn!(client = %client_addr, %err, "failed to send bedrock handshake reply");
@@ -391,16 +444,28 @@ async fn handle_offline_datagram(
 }
 
 fn can_start_fake_session(
-    fake_sessions: &HashMap<SocketAddr, FakeSession>,
+    fake_sessions: &HashMap<SocketAddr, OfflineSession>,
     client_addr: SocketAddr,
 ) -> bool {
     fake_sessions.contains_key(&client_addr) || fake_sessions.len() < MAX_FAKE_SESSIONS
 }
 
-fn spawn_reachability_prober(target_addr: SocketAddr, probe_timeout: Duration) -> Arc<AtomicU8> {
+fn reachability_for(
+    config: &UdpProxyConfig,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Option<Arc<AtomicU8>> {
+    (config.targets.len() == 1 && config.bedrock_offline.is_some())
+        .then(|| spawn_reachability_prober(config.targets[0], config.probe_timeout, tasks))
+}
+
+fn spawn_reachability_prober(
+    target_addr: SocketAddr,
+    probe_timeout: Duration,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> Arc<AtomicU8> {
     let reachable = Arc::new(AtomicU8::new(REACHABILITY_UNKNOWN));
     let flag = reachable.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             let state = if bedrock_offline::probe_target(target_addr, probe_timeout).await {
                 REACHABILITY_UP
@@ -637,7 +702,10 @@ mod tests {
         for port in 1..=MAX_FAKE_SESSIONS as u16 {
             fake_sessions.insert(
                 SocketAddr::from(([127, 0, 0, 1], port)),
-                bedrock_offline::new_session(),
+                OfflineSession {
+                    session: bedrock_offline::new_session(),
+                    config: BedrockOfflineConfig::new("Offline".into(), "Try later".into()),
+                },
             );
         }
         let existing = SocketAddr::from(([127, 0, 0, 1], 1));

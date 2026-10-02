@@ -159,9 +159,10 @@ redirect flags so settings cannot silently conflict.
 
 | Command | Purpose |
 | --- | --- |
-| `redir-rust` | Open the menu: Start, Stop, Setup Config, Edit Config, Status, Monitor, Open GUI, Check for updates, Exit. |
+| `redir-rust` | Open the menu: Start, Stop, Setup Config, Edit Config, Status, Monitor, Open GUI, Reload, Check for updates, Exit. |
 | `redir-rust --gui` | Open the browser manager. |
 | `redir-rust --monitor` | View service connection and traffic snapshots from `/run/redir-rust/` on Linux. |
+| `redir-rust --reload` | Apply the saved config while established clients keep their sessions. |
 | `redir-rust --service-status` | Show service status. |
 | `redir-rust --add --name NAME --listen IP:PORT --target IP:PORT` | Add a named redirect. |
 | `redir-rust --edit NAME` | Edit one redirect in `$EDITOR`. |
@@ -172,7 +173,25 @@ redirect flags so settings cannot silently conflict.
 The GUI binds all IPv4 interfaces on an automatic port by default. Its per-run
 URL grants configuration and service control: keep it private and use a trusted
 LAN or HTTPS proxy. Use `--gui-bind 127.0.0.1:8080` for local access.
-Configuration changes need a service restart to take effect.
+After saving, choose **Reload** in the menu or GUI. Reload applies changes to new
+connections while established TCP connections and UDP sessions keep their
+original backend and settings. Invalid configuration or a failed new bind leaves
+the running configuration intact. Restart remains available for binary upgrades.
+
+```sh
+sudo redir-rust --reload
+# For a manually started instance:
+redir-rust --reload --config config.toml
+# With the updated systemd unit:
+sudo systemctl reload redir-rust
+```
+
+Reload requires an instance started with `--config` or `--settings`. Removing a
+TCP listener closes its listening socket while established connections continue.
+Removed UDP listeners accept packets only from existing clients until their
+original idle timeouts expire. A listen-address change that overlaps an existing
+or draining socket is rejected; move to a free address or drain the old listener
+before reusing its port. See [reload behavior](docs/usage.md#graceful-reload).
 
 [Guided editing, Tailscale address picker, and monitoring keys](docs/usage.md) ·
 [systemd details](packaging/systemd/README.md)

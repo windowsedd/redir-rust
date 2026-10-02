@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,8 @@ struct ConnCounters {
 /// Lifetime totals for one redirect; unlike per-connection counters these
 /// survive connections closing, so graphs don't dip when a client leaves.
 struct Totals {
-    protocol: &'static str,
+    protocol: Mutex<&'static str>,
+    retired: AtomicBool,
     listen: Mutex<String>,
     up: AtomicU64,
     down: AtomicU64,
@@ -79,7 +80,8 @@ fn totals_for(redirect: &str, protocol: &'static str) -> Arc<Totals> {
         .entry(redirect.to_string())
         .or_insert_with(|| {
             Arc::new(Totals {
-                protocol,
+                protocol: Mutex::new(protocol),
+                retired: AtomicBool::new(false),
                 listen: Mutex::new(String::new()),
                 up: AtomicU64::new(0),
                 down: AtomicU64::new(0),
@@ -93,7 +95,16 @@ fn totals_for(redirect: &str, protocol: &'static str) -> Arc<Totals> {
 pub fn register_redirect(name: &str, protocol: &'static str, listen: SocketAddr) {
     let _ = *STARTED_MS;
     let totals = totals_for(name, protocol);
+    totals.retired.store(false, Ordering::Relaxed);
+    *totals.protocol.lock().unwrap_or_else(|p| p.into_inner()) = protocol;
     *totals.listen.lock().unwrap_or_else(|p| p.into_inner()) = listen.to_string();
+}
+
+/// Retired redirects remain visible only while their old clients drain.
+pub fn retire_redirect(name: &str) {
+    if let Some(totals) = totals_map().get(name) {
+        totals.retired.store(true, Ordering::Relaxed);
+    }
 }
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| Registry {
@@ -261,10 +272,11 @@ pub fn snapshots() -> (Vec<serde_json::Value>, serde_json::Value) {
     }
     let mut redirects: Vec<serde_json::Value> = totals_map()
         .iter()
+        .filter(|(name, t)| !t.retired.load(Ordering::Relaxed) || open.contains_key(name.as_str()))
         .map(|(name, t)| {
             serde_json::json!({
                 "name": name,
-                "protocol": t.protocol,
+                "protocol": *t.protocol.lock().unwrap_or_else(|p| p.into_inner()),
                 "listen": *t.listen.lock().unwrap_or_else(|p| p.into_inner()),
                 "up_total": t.up.load(Ordering::Relaxed),
                 "down_total": t.down.load(Ordering::Relaxed),
@@ -374,6 +386,43 @@ mod tests {
     /// itself instead of poisoning the mutex for every other test.
     fn is_registered(id: u64) -> bool {
         entries().contains_key(&id)
+    }
+
+    #[test]
+    fn reloading_protocol_updates_redirect_metadata() {
+        let name = "protocol-reload-test";
+        let addr = "127.0.0.1:42001".parse().unwrap();
+        register_redirect(name, "tcp", addr);
+        register_redirect(name, "udp", addr);
+        let snapshot = snapshots().1;
+        let row = snapshot["redirects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["protocol"], "udp");
+    }
+
+    #[test]
+    fn retired_redirect_stays_visible_until_clients_finish() {
+        let name = "retired-test";
+        let addr = "127.0.0.1:42000".parse().unwrap();
+        register_redirect(name, "tcp", addr);
+        let guard = track(name, "tcp", addr, addr);
+        retire_redirect(name);
+        let visible = || {
+            snapshots().1["redirects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == name)
+        };
+        assert!(visible());
+        drop(guard);
+        assert!(!visible());
+        register_redirect(name, "tcp", addr);
+        assert!(visible());
     }
 
     #[test]

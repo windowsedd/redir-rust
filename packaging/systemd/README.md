@@ -182,3 +182,22 @@ file for `active_connections`.
   ]
 }
 ```
+
+
+### Reload configuration
+
+With the current binary and unit installed, run:
+
+```sh
+sudo systemctl reload redir-rust
+```
+
+`ExecReload` calls `redir-rust --reload --settings /etc/local/redir-rust/settings.json`
+and waits for the running process to acknowledge the change. Failed validation
+or a new listener bind failure preserves the active configuration. Existing TCP
+connections and UDP sessions keep forwarding. See
+[graceful reload details](../../docs/usage.md#graceful-reload).
+
+After upgrading an older installation, install the updated unit and run
+`sudo systemctl daemon-reload`. A running older binary needs one restart to gain
+reload support; later config-only changes can use reload.

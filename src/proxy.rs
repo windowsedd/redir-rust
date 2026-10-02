@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::connections;
@@ -55,6 +56,14 @@ pub async fn run(config: ProxyConfig, plugins: Vec<Arc<dyn Plugin>>) -> io::Resu
     run_with_listener(config, listener, plugins).await
 }
 
+/// Settings are snapshotted when a client is accepted; existing connections
+/// retain their original targets, plugins and shaping configuration.
+#[derive(Clone)]
+pub struct TcpSettings {
+    pub config: ProxyConfig,
+    pub plugins: Vec<Arc<dyn Plugin>>,
+}
+
 pub async fn run_with_listener(
     mut config: ProxyConfig,
     listener: TcpListener,
@@ -62,7 +71,42 @@ pub async fn run_with_listener(
 ) -> io::Result<()> {
     validate_config(&config)?;
     config.listen_addr = listener.local_addr()?;
-    run_loop(config, listener, plugins).await
+    let (_keep_alive, updates) = watch::channel(Some(TcpSettings { config, plugins }));
+    run_reconfigurable(listener, updates).await
+}
+
+/// None retires the listener. Detached connection tasks continue running.
+pub async fn run_reconfigurable(
+    listener: TcpListener,
+    mut updates: watch::Receiver<Option<TcpSettings>>,
+) -> io::Result<()> {
+    let addr = listener.local_addr()?;
+    loop {
+        tokio::select! {
+            biased;
+            changed = updates.changed() => {
+                if changed.is_err() || updates.borrow().is_none() { return Ok(()); }
+            }
+            accepted = listener.accept() => {
+                let (client, client_addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        warn!(%err, "failed to accept connection");
+                        continue;
+                    }
+                };
+                let Some(mut settings) = updates.borrow().clone() else { return Ok(()); };
+                settings.config.listen_addr = addr;
+                let plugins: Vec<_> = settings.plugins.into_iter()
+                    .filter(|p| p.applies_to(addr)).collect();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(client, client_addr, &settings.config, &plugins).await {
+                        debug!(client = %client_addr, %err, "connection ended with error");
+                    }
+                });
+            }
+        }
+    }
 }
 
 fn validate_config(config: &ProxyConfig) -> io::Result<()> {
@@ -73,41 +117,6 @@ fn validate_config(config: &ProxyConfig) -> io::Result<()> {
         ));
     }
     Ok(())
-}
-
-async fn run_loop(
-    config: ProxyConfig,
-    listener: TcpListener,
-    plugins: Vec<Arc<dyn Plugin>>,
-) -> io::Result<()> {
-    info!(name = %config.name, listen = %config.listen_addr, targets = ?config.targets, "listening");
-
-    let active_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .into_iter()
-        .filter(|p| p.applies_to(config.listen_addr))
-        .collect();
-
-    for plugin in &active_plugins {
-        debug!(plugin = plugin.name(), "plugin active for this listener");
-    }
-
-    loop {
-        let (client, client_addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(err) => {
-                warn!(%err, "failed to accept connection");
-                continue;
-            }
-        };
-
-        let config = config.clone();
-        let plugins = active_plugins.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, client_addr, &config, &plugins).await {
-                debug!(client = %client_addr, %err, "connection ended with error");
-            }
-        });
-    }
 }
 
 async fn handle_connection(

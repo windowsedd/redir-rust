@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=main
 ExecStart=/usr/local/bin/redir-rust --settings /etc/local/redir-rust/settings.json
+ExecReload=/usr/local/bin/redir-rust --reload --settings /etc/local/redir-rust/settings.json
 Restart=on-failure
 RestartSec=2
 Environment=RUST_LOG=info

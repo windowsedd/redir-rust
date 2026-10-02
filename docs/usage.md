@@ -5,7 +5,7 @@
 ## Usage
 
 Run `redir-rust` without arguments to open a terminal menu with Start, Stop,
-Setup Config, Edit Config, Status, Monitor, Open GUI, Check for updates, and Exit. Run `redir-rust --gui`
+Setup Config, Edit Config, Status, Monitor, Open GUI, Reload, Check for updates, and Exit. Run `redir-rust --gui`
 to open the graphical manager directly in your browser. The GUI listens on all
 IPv4 interfaces by default, on an automatic port. It prints a per-run access
 URL with a detected network IP when available. Use `--gui-bind IP:PORT` to select a
@@ -47,7 +47,7 @@ arrow keys on a terminal and numbered choices when piped. Each change has a
 review/save prompt and is validated before writing; other service blocks are
 preserved. **🛠 Advanced editor** opens the selected named service in `$EDITOR`
 for plugin text and other options (the full file for an unnamed service).
-Restart redir-rust after saving to apply the changes. `-e` / `--edit-config`
+Reload redir-rust after saving to apply the changes. `-e` / `--edit-config`
 still opens the full config in your editor directly.
 
 Run `redir-rust --monitor` to view live connections and traffic in a terminal.
@@ -148,3 +148,52 @@ backend; that session remains pinned there until its UDP idle timeout expires.
 New sessions start at the primary again. If all probes fail, the Bedrock
 offline plugin handles the queued packets when enabled. Single-target generic
 UDP does not receive Bedrock preflight probes; it remains a direct relay.
+
+
+## Graceful reload
+
+After editing configuration, choose **Reload** in the terminal menu or browser
+manager. Or run `redir-rust --reload --config /path/to/config.toml` from another
+terminal. With `--settings FILE`, reload resolves the config path from that
+settings file. Without either flag, it uses the default settings/config location.
+The command returns success only after the running process accepts the update;
+it reports validation and bind errors without stopping forwarding.
+
+Linux's packaged systemd unit supports `sudo systemctl reload redir-rust`.
+For a foreground instance on Unix, `kill -HUP <PID>` reloads the same original
+config file; rejection details appear in its logs. Direct CLI redirects have no
+config source and cannot reload. The config path is fixed at startup: changing
+`settings.json` to point to another file requires a restart.
+
+Reload validates the entire file, loads plugin assets, and reserves every added
+listener before changing existing settings. TCP and UDP at the same numeric port
+are separate listeners. Duplicate listener addresses in the same protocol fail
+validation. The listener stays open for target, name, timeout, shaping, and plugin
+changes; existing clients retain the configuration chosen when they connected.
+Pending Bedrock backend selections and offline handshakes keep their original
+settings, too. A reload can add listeners on free addresses.
+
+A removed TCP listener stops accepting clients and existing connection tasks
+finish normally. A removed UDP listener continues serving established sessions,
+pending selections, and offline handshakes, but rejects new clients. Its socket
+closes after those sessions expire. Repeated client traffic can keep an existing
+UDP session alive. An empty, valid config retires all listeners while keeping the
+process available for future reloads.
+
+To change a wildcard listener to a specific IP on the same port, first remove
+that listener and reload, then add the replacement once the old socket is free.
+Reload rejects overlapping binds instead of interrupting old traffic. A change
+from TCP to UDP can also conflict with an independently configured UDP listener.
+
+The running process publishes a loopback-only control address and a per-run
+authentication token in `<canonical-config-path>.reload.json`. Unix permissions
+are `0600`; run reload as the same user or root. On Windows, a protected access list grants access only to the file owner
+and SYSTEM. The
+config directory must be writable to publish the endpoint. If it is not,
+forwarding still starts and Unix SIGHUP remains available, but CLI/menu/GUI
+reload reports that no accessible endpoint exists. Stale endpoint files from a
+crash are replaced on startup; normal shutdown removes the process's own file.
+
+Reload changes configuration, not the running executable. Binary upgrades still
+need a restart. The live monitor keeps removed redirects visible while their
+clients drain and hides their rows after the final tracked client leaves.

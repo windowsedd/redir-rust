@@ -6,7 +6,7 @@ use redir_rust::{config_manager, service_ctl, status};
 
 use crate::setup;
 
-const ITEMS: [&str; 8] = [
+const ITEMS: [&str; 9] = [
     "Start",
     "Stop",
     "Setup Config",
@@ -14,10 +14,11 @@ const ITEMS: [&str; 8] = [
     "Status",
     "Monitor",
     "Open GUI",
+    "Reload",
     "Exit",
 ];
 
-const DESCRIPTIONS: [&str; 8] = [
+const DESCRIPTIONS: [&str; 9] = [
     "Start the service",
     "Stop the service",
     "Add a redirect",
@@ -25,6 +26,7 @@ const DESCRIPTIONS: [&str; 8] = [
     "Inspect the service",
     "Watch traffic",
     "Open browser manager",
+    "Apply config without disconnecting clients",
     "",
 ];
 
@@ -167,6 +169,13 @@ pub fn run() -> ExitCode {
                     }
                 };
             }
+            7 => match config_path() {
+                Ok(path) => match redir_rust::reload::request(&path) {
+                    Ok(()) => println!("Configuration reloaded; established sessions retained."),
+                    Err(err) => eprintln!("error: reload failed: {err}"),
+                },
+                Err(err) => eprintln!("error: {err}"),
+            },
             _ => return ExitCode::SUCCESS,
         }
         if interactive {
@@ -201,7 +210,7 @@ fn select_with_number() -> io::Result<Option<usize>> {
         for (index, (label, description)) in ITEMS.iter().zip(DESCRIPTIONS).enumerate() {
             println!("  {}  {label:<14} {description}", index + 1);
         }
-        print!("Select [1-8]: ");
+        print!("Select [1-9]: ");
         io::stdout().flush()?;
         let mut answer = String::new();
         if io::stdin().read_line(&mut answer)? == 0 {
@@ -209,7 +218,7 @@ fn select_with_number() -> io::Result<Option<usize>> {
         }
         match answer.trim().parse::<usize>() {
             Ok(n) if (1..=ITEMS.len()).contains(&n) => return Ok(Some(n - 1)),
-            _ => eprintln!("Choose a number from 1 to 8."),
+            _ => eprintln!("Choose a number from 1 to 9."),
         }
     }
 }

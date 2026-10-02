@@ -12,27 +12,7 @@ const CONFIG_DIR: &str = "/etc/local/redir-rust";
 const SETTINGS_FILE: &str = "/etc/local/redir-rust/settings.json";
 const UNIT_FILE: &str = "/etc/systemd/system/redir-rust.service";
 
-const UNIT_TEMPLATE: &str = "\
-[Unit]
-Description=redir-rust port redirector
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=notify
-NotifyAccess=main
-ExecStart=/usr/local/bin/redir-rust --settings /etc/local/redir-rust/settings.json
-Restart=on-failure
-RestartSec=2
-Environment=RUST_LOG=info
-RuntimeDirectory=redir-rust
-
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-";
+const UNIT_TEMPLATE: &str = include_str!("../packaging/systemd/redir-rust.service");
 
 #[cfg(unix)]
 pub fn run(bin_dir: &Path) -> ExitCode {
